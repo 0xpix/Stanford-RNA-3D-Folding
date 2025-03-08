@@ -88,6 +88,10 @@ valid_sequences = pd.read_csv("data/raw/validation_sequences.csv")
 train_labels = pd.read_csv("data/raw/train_labels.csv")
 valid_labels = pd.read_csv("data/raw/validation_labels.csv")
 
+# 🔹 Fill NaN values
+train_labels.fillna(0, inplace=True)
+valid_labels.fillna(0, inplace=True)
+
 # 🔹 Process labels
 log_message("Processing labels")
 train_labels_dict = process_labels(train_labels)
