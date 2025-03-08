@@ -4,7 +4,7 @@
 
 # create Requirements.txt
 requirements:
-	@pip freeze > requirements.txt
+	@pipreqs . --force
 
 # conda environment (This is just for my pc - you can ignore this)
 conda:
@@ -36,6 +36,23 @@ visualize:
 
 # Run all: RUNS ALL SCRIPTS - DEFAULT
 all: download preprocess train test evaluate visualize
+
+#---------------------------------------------------
+# SSH into Kaggle
+#---------------------------------------------------
+
+zrok-access:
+	@echo "Zrok Access"
+	@zrok disable
+	@zrok enable "sTi4BOxak4Ox"
+	@zrok access private 0u0aho8aijjc
+
+ssh-kaggle:
+	@echo "SSH into Kaggle"
+	@scp -r -P 9191 -i ~/.ssh/kaggle_rsa ./* root@127.0.0.1:/kaggle/working/Stanford-RNA-3D-Folding/
+# @ssh -p 9191 -i ~/.ssh/kaggle_rsa root@127.0.0.1
+	@ssh Kaggle
+	@ls -lh /kaggle/working/Stanford-RNA-3D-Folding/
 
 #---------------------------------------------------
 # Cleaning folders
