@@ -1,0 +1,13 @@
+DATA:
+  datainterimdirectory: data/interim/
+  datalink: https://gist.githubusercontent.com/netj/8836201/raw/6f9306ad21398ea43cba4f7d537619d0e07d5ae3/iris.csv
+  dataname: iris
+  dataprocesseddirectory: data/processed/
+  datarawdirectory: data/raw/
+MODELS:
+  modelpath: models/model.pkl
+RESULTS:
+  resultsevaluatedpath: results/results_evaluated.pkl
+  resultsrawpath: results/results_raw.pkl
+VISUALIZATION:
+  figuredirectory: reports/figures/
