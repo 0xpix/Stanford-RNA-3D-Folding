@@ -10,6 +10,12 @@ requirements:
 conda:
 	@conda activate AI
 
+# Run the Unitest
+test:
+	@PYTHONPATH=. python tests/test_download.py
+
+# @python -m unittest discover tests -v
+
 # Download the data
 download:
 	@python -m src.data.download
@@ -23,7 +29,7 @@ train:
 	@python -m src.model.train
 
 # Make predictions on the test data
-test:
+predict:
 	@python -m src.model.predict
 
 # Evaluate performance
@@ -35,7 +41,7 @@ visualize:
 	@python -m src.visualization.visualize
 
 # Run all: RUNS ALL SCRIPTS - DEFAULT
-all: download preprocess train test evaluate visualize
+all: download preprocess train predict evaluate visualize
 
 #---------------------------------------------------
 # SSH into Kaggle
