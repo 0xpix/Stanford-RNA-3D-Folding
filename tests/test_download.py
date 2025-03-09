@@ -1,6 +1,7 @@
-import unittest
 import os
 import zipfile
+
+import unittest
 from unittest.mock import patch, MagicMock
 
 # Import your variables from the actual download script
