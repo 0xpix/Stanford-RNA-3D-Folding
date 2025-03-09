@@ -1,0 +1,6 @@
+flax==0.10.3
+jax==0.5.2
+numpy==2.2.3
+optax==0.2.4
+pandas==2.2.3
+termcolor==2.5.0
