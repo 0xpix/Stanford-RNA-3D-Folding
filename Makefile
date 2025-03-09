@@ -45,10 +45,11 @@ zrok-access:
 	@echo "Zrok Access"
 	@zrok disable
 	@zrok enable "sTi4BOxak4Ox"
-	@zrok access private fbpu5zpi2jx2
+	@zrok access private 682vovkysn20
 
 ssh-kaggle:
 	@echo "SSH into Kaggle"
+	@ssh-keygen -f "/home/pix/.ssh/known_hosts" -R "[127.0.0.1]:9191"
 	@rsync -avz -e "ssh -p 9191 -i ~/.ssh/kaggle_rsa" . root@127.0.0.1:/kaggle/working/Stanford-RNA-3D-Folding/
 # @ssh -p 9191 -i ~/.ssh/kaggle_rsa root@127.0.0.1
 	@ssh Kaggle
