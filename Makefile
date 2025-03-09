@@ -48,9 +48,9 @@ all: download preprocess train predict evaluate visualize
 
 zrok-access:
 	@echo "Zrok Access"
-	@zrok disable
+# @zrok disable
 	@zrok enable "sTi4BOxak4Ox"
-	@zrok access private 682vovkysn20
+	@zrok access private fqo3t0n4tgx1
 
 ssh-kaggle:
 	@echo "SSH into Kaggle"
