@@ -8,3 +8,5 @@ __pycache__/
 .idea/
 notebooks/.ipynb_checkpoints/
 
+src/instadeep/*
+setup.py
