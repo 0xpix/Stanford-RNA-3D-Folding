@@ -12,9 +12,8 @@ conda:
 
 # Run the Unitest
 test:
-	@PYTHONPATH=. python tests/test_download.py
-
-# @python -m unittest discover tests -v
+# @PYTHONPATH=. python tests/test_download.py
+	@python -m unittest discover tests
 
 # Download the data
 download:
