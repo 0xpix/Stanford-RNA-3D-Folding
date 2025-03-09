@@ -79,45 +79,46 @@ def pad_coordinates_jax(coord_array, max_len):
         return jnp.pad(coord_array, pad_width, mode='constant', constant_values=0)
     return coord_array
 
-log_message("🧬 Data processing started!")
-check_jax_device()
-# 🔹 Load data
-log_message("Loading raw data")
-train_sequences = pd.read_csv("data/raw/train_sequences.csv")
-valid_sequences = pd.read_csv("data/raw/validation_sequences.csv")
-train_labels = pd.read_csv("data/raw/train_labels.csv")
-valid_labels = pd.read_csv("data/raw/validation_labels.csv")
+if __name__ == "__main__":
+    log_message("🧬 Data processing started!")
+    check_jax_device()
+    # 🔹 Load data
+    log_message("Loading raw data")
+    train_sequences = pd.read_csv("data/raw/train_sequences.csv")
+    valid_sequences = pd.read_csv("data/raw/validation_sequences.csv")
+    train_labels = pd.read_csv("data/raw/train_labels.csv")
+    valid_labels = pd.read_csv("data/raw/validation_labels.csv")
 
-# 🔹 Fill NaN values
-train_labels.fillna(0, inplace=True)
-valid_labels.fillna(0, inplace=True)
+    # 🔹 Fill NaN values
+    train_labels.fillna(0, inplace=True)
+    valid_labels.fillna(0, inplace=True)
 
-# 🔹 Process labels
-log_message("Processing labels")
-train_labels_dict = process_labels(train_labels)
-valid_labels_dict = process_labels(valid_labels)
+    # 🔹 Process labels
+    log_message("Processing labels")
+    train_labels_dict = process_labels(train_labels)
+    valid_labels_dict = process_labels(valid_labels)
 
-# 🔹 Create datasets
-log_message("Creating datasets")
-X_train, y_train, train_ids = create_dataset(train_sequences, train_labels_dict)
-X_valid, y_valid, valid_ids = create_dataset(valid_sequences, valid_labels_dict)
+    # 🔹 Create datasets
+    log_message("Creating datasets")
+    X_train, y_train, train_ids = create_dataset(train_sequences, train_labels_dict)
+    X_valid, y_valid, valid_ids = create_dataset(valid_sequences, valid_labels_dict)
 
-# 🔹 Determine max sequence length
-max_len = max(max(len(seq) for seq in X_train), max(len(seq) for seq in X_valid))
+    # 🔹 Determine max sequence length
+    max_len = max(max(len(seq) for seq in X_train), max(len(seq) for seq in X_valid))
 
-# 🔹 Pad sequences using JAX
-log_message("Determining max sequence length")
-X_train_pad = pad_sequences_jax(X_train, max_len)
-X_valid_pad = pad_sequences_jax(X_valid, max_len)
+    # 🔹 Pad sequences using JAX
+    log_message("Determining max sequence length")
+    X_train_pad = pad_sequences_jax(X_train, max_len)
+    X_valid_pad = pad_sequences_jax(X_valid, max_len)
 
-# 🔹 Pad labels using JAX
-log_message("Padding coordinates")
-y_train_pad = jnp.array([pad_coordinates_jax(arr, max_len) for arr in y_train])
-y_valid_pad = jnp.array([pad_coordinates_jax(arr, max_len) for arr in y_valid])
+    # 🔹 Pad labels using JAX
+    log_message("Padding coordinates")
+    y_train_pad = jnp.array([pad_coordinates_jax(arr, max_len) for arr in y_train])
+    y_valid_pad = jnp.array([pad_coordinates_jax(arr, max_len) for arr in y_valid])
 
-# 🔹 Save processed data
-log_message("Saving processed data")
-with open("data/processed/processed_data.pkl", "wb") as f:
-    pickle.dump((X_train_pad, y_train_pad, X_valid_pad, y_valid_pad, max_len), f)
+    # 🔹 Save processed data
+    log_message("Saving processed data")
+    with open("data/processed/processed_data.pkl", "wb") as f:
+        pickle.dump((X_train_pad, y_train_pad, X_valid_pad, y_valid_pad, max_len), f)
 
-log_message("✅ Data processing complete! \n")
+    log_message("✅ Data processing complete! \n")
