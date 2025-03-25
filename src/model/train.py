@@ -2,7 +2,6 @@
 Training script for RNA 3D structure prediction model.
 """
 
-import os
 import pickle
 import argparse
 import time
@@ -12,7 +11,6 @@ import json
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -133,6 +131,60 @@ def save_training_history(history, output_path):
     log_message(f"Saved training history and plots to {output_path}")
 
 
+def compute_loss(params, apply_fn, inputs, targets, rng=None, training=True):
+    """Compute RMSD loss between predicted and actual coordinates."""
+    # Apply mask to only consider non-padded positions
+    # Assuming 0 coordinates are padding
+    mask = (targets != 0).any(axis=-1)
+
+    # Forward pass - include rng key for dropout
+    if training and rng is not None:
+        predictions = apply_fn(params, inputs, training=training, rngs={"dropout": rng})
+    else:
+        # For evaluation, no rng needed
+        predictions = apply_fn(params, inputs, training=training)
+
+    # Compute squared error with masking
+    squared_error = jnp.sum((predictions - targets) ** 2, axis=-1) * mask
+
+    # Compute RMSD for non-padded positions
+    rmsd = jnp.sqrt(jnp.sum(squared_error) / jnp.sum(mask))
+
+    return rmsd
+
+
+def train_step(state, batch, rng):
+    """Execute one training step."""
+    inputs, targets = batch
+
+    # Define gradient function
+    def loss_fn(params):
+        return compute_loss(
+            params, state.apply_fn, inputs, targets, rng=rng, training=True
+        )
+
+    # Compute gradients
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = grad_fn(state.params)
+
+    # Update parameters
+    new_state = state.apply_gradients(grads=grads)
+
+    return new_state, loss
+
+
+def eval_step(state, batch):
+    """Execute one evaluation step."""
+    inputs, targets = batch
+    loss = compute_loss(state.params, state.apply_fn, inputs, targets, training=False)
+    return loss
+
+
+def predict(state, sequences):
+    """Generate 3D structure predictions for RNA sequences."""
+    return state.apply_fn(state.params, sequences, training=False)
+
+
 def train_model(args):
     """Train RNA 3D folding model with given arguments."""
     # Check JAX device
@@ -221,7 +273,7 @@ def train_model(args):
                 batch_X = X_train_shuffled[start_idx:end_idx]
                 batch_y = y_train_shuffled[start_idx:end_idx]
 
-                state, loss = RNAFoldingModel.train_step(state, (batch_X, batch_y))
+                state, loss = train_step(state, (batch_X, batch_y), rng)
                 total_loss += loss
 
             avg_train_loss = total_loss / num_batches
@@ -242,7 +294,7 @@ def train_model(args):
                     batch_X = X_eval[start_idx:end_idx]
                     batch_y = y_eval[start_idx:end_idx]
 
-                    loss = RNAFoldingModel.eval_step(state, (batch_X, batch_y))
+                    loss = eval_step(state, (batch_X, batch_y))
                     eval_loss += loss
 
                 avg_eval_loss = eval_loss / eval_batches
