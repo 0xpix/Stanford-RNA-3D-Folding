@@ -11,11 +11,13 @@ import json
 
 import jax
 import jax.numpy as jnp
+import optax
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from src.model.model import RNAFoldingModel, ModelConfig
 from src.utils.utils import log_message, check_jax_device
+from flax.training import train_state  # Import train_state
 
 
 def parse_args():
@@ -185,6 +187,30 @@ def predict(state, sequences):
     return state.apply_fn(state.params, sequences, training=False)
 
 
+def save_model_params(state, output_path):
+    """Save model parameters to a file (instead of pickling the entire state)."""
+    with open(output_path, "wb") as f:
+        pickle.dump(state.params, f)
+    log_message(f"Saved model parameters to {output_path}")
+
+
+def load_model_params(model, params_path, learning_rate=1e-3, rng=None):
+    """Load model parameters and recreate the training state."""
+    with open(params_path, "rb") as f:
+        params = pickle.load(f)
+
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    # Recreate optimizer
+    tx = optax.adam(learning_rate)
+
+    # Recreate state
+    return train_state.TrainState.create(
+        apply_fn=model.model.apply, params=params, tx=tx
+    )
+
+
 def train_model(args):
     """Train RNA 3D folding model with given arguments."""
     # Check JAX device
@@ -302,8 +328,7 @@ def train_model(args):
                 # Save best model
                 if avg_eval_loss < best_eval_loss:
                     best_eval_loss = avg_eval_loss
-                    with open(output_path / "best_model.pkl", "wb") as f:
-                        pickle.dump(state, f)
+                    save_model_params(state, output_path / "best_model_params.pkl")
                     log_message(
                         f"Saved new best model with eval loss: {best_eval_loss:.4f}"
                     )
@@ -329,15 +354,15 @@ def train_model(args):
             # Periodically save history and checkpoints
             if (epoch + 1) % 5 == 0:
                 # Save checkpoint
-                with open(output_path / f"checkpoint_epoch_{epoch+1}.pkl", "wb") as f:
-                    pickle.dump(state, f)
+                save_model_params(
+                    state, output_path / f"checkpoint_epoch_{epoch+1}_params.pkl"
+                )
 
                 # Save current history
                 save_training_history(history, output_path)
 
         # Save final model
-        with open(output_path / "final_model.pkl", "wb") as f:
-            pickle.dump(state, f)
+        save_model_params(state, output_path / "final_model_params.pkl")
 
         # Save training history
         save_training_history(history, output_path)
@@ -358,12 +383,13 @@ def train_model(args):
         log_message(f"Error during training: {e}", level="ERROR")
         # Try to save current progress if possible
         try:
-            with open(output_path / "interrupted_model.pkl", "wb") as f:
-                pickle.dump(state, f)
+            save_model_params(state, output_path / "interrupted_model_params.pkl")
             save_training_history(history, output_path)
             log_message(f"Saved interrupted model to {output_path}")
-        except:
-            log_message("Could not save interrupted model", level="ERROR")
+        except Exception as save_error:
+            log_message(
+                f"Could not save interrupted model: {save_error}", level="ERROR"
+            )
         raise
 
 
