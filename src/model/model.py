@@ -52,28 +52,24 @@ class TransformerEncoderBlock(nn.Module):
     @nn.compact
     def __call__(self, x, training: bool = True):
         # Multi-head attention
+        # Pass deterministic parameter directly to MultiHeadAttention
         attn_output = nn.MultiHeadAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
             dropout_rate=self.dropout_rate,
-        )(x, x, x)
+        )(x, x, x, deterministic=not training)  # Pass deterministic here
 
         # Residual connection and layer normalization
-        x = x + nn.Dropout(rate=self.dropout_rate)(
-            attn_output, deterministic=not training
-        )
+        x = x + nn.Dropout(rate=self.dropout_rate)(x, deterministic=not training)
         x = nn.LayerNorm()(x)
 
-        # Feed-forward network
-        ff_output = nn.Sequential(
-            [
-                nn.Dense(self.d_ff),
-                nn.relu,
-                nn.Dropout(rate=self.dropout_rate, deterministic=not training),
-                nn.Dense(self.d_model),
-                nn.Dropout(rate=self.dropout_rate, deterministic=not training),
-            ]
-        )(x)
+        # Feed-forward network - Update to use nn.Sequential properly
+        # Sequential in Flax doesn't handle deterministic parameter automatically
+        ff = nn.Dense(self.d_ff)(x)
+        ff = nn.relu(ff)
+        ff = nn.Dropout(rate=self.dropout_rate)(ff, deterministic=not training)
+        ff = nn.Dense(self.d_model)(ff)
+        ff_output = nn.Dropout(rate=self.dropout_rate)(ff, deterministic=not training)
 
         # Residual connection and layer normalization
         x = x + ff_output
