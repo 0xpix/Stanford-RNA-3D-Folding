@@ -1,259 +1,328 @@
+"""
+Training script for RNA 3D structure prediction model.
+"""
+
+import os
+import pickle
+import argparse
+import time
+from datetime import datetime
+from pathlib import Path
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
-import pickle
-import time
-import os
+import matplotlib.pyplot as plt
 from tqdm import tqdm
-from flax.training import train_state
-from flax.training import checkpoints
 
-from src.model.model import ProteinTransformer
-from src.utils import log_message
-
-# ---------- Training Functions ---------
+from src.model.model import RNAFoldingModel, ModelConfig
+from src.utils.utils import log_message, check_jax_device
 
 
-def mse_loss(pred, target):
-    """Mean squared error loss function with better numerical stability."""
-    # Mask NaN values if they exist
-    pred = jnp.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
-    # Clip extreme values
-    pred = jnp.clip(pred, -1e6, 1e6)
-    # Calculate loss with better epsilon
-    loss = jnp.mean((pred - target) ** 2 + 1e-10)
-    return loss
-
-
-@jax.jit
-def train_step(state, batch_x_combined, batch_y, rng):
-    """Single training step with gradient checking."""
-
-    def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            batch_x_combined,
-            rngs={"dropout": rng},
-            deterministic=False,
-        )
-        return mse_loss(pred, batch_y)
-
-    grads = jax.grad(loss_fn)(state.params)
-
-    # Check for NaN or infinity in gradients and replace with zeros
-    # Fix deprecated jax.tree_map
-    try:
-        import jax.tree as tree
-
-        grads = tree.map(
-            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads
-        )
-    except ImportError:
-        # Fallback for older JAX versions
-        grads = jax.tree_util.tree_map(
-            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads
-        )
-
-    loss = loss_fn(state.params)
-    new_state = state.apply_gradients(grads=grads)
-
-    return new_state, loss, grads
-
-
-@jax.jit
-def eval_step(state, batch_x_combined, batch_y):
-    """Evaluation step."""
-    pred = state.apply_fn(
-        {"params": state.params}, batch_x_combined, deterministic=True
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train RNA 3D structure prediction model"
     )
-    return mse_loss(pred, batch_y)
+
+    # Data parameters
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="data/processed/preprocessed_data_final.pkl",
+        help="Path to preprocessed data",
+    )
+
+    # Model parameters
+    parser.add_argument(
+        "--d_model", type=int, default=128, help="Dimension of transformer model"
+    )
+    parser.add_argument(
+        "--num_heads", type=int, default=8, help="Number of attention heads"
+    )
+    parser.add_argument(
+        "--d_ff", type=int, default=512, help="Dimension of feed-forward network"
+    )
+    parser.add_argument(
+        "--num_layers", type=int, default=4, help="Number of transformer layers"
+    )
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+
+    # Training parameters
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=30, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=1e-3, help="Initial learning rate"
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--eval_every", type=int, default=1, help="Evaluate every N epochs"
+    )
+
+    # Output parameters
+    parser.add_argument(
+        "--output_dir", type=str, default="models", help="Directory to save models"
+    )
+    parser.add_argument(
+        "--model_name", type=str, default=None, help="Model name (default: timestamp)"
+    )
+
+    return parser.parse_args()
 
 
-def log_gradient_stats(grads, prefix=""):
-    """Log gradient statistics for debugging."""
-    stats_message = ["Gradient Statistics:"]
+def load_data(data_path):
+    """Load preprocessed RNA folding data."""
+    log_message(f"Loading preprocessed data from {data_path}")
 
-    def collect_grad_stats(grads, prefix=""):
-        for k, v in grads.items():
-            if isinstance(v, dict):
-                collect_grad_stats(v, prefix=f"{prefix}{k}.")
-            else:
-                mean_val = float(jnp.mean(v))
-                std_val = float(jnp.std(v))
-                min_val = float(jnp.min(v))
-                max_val = float(jnp.max(v))
-                stats_message.append(
-                    f"{prefix}{k}: Mean={mean_val:.6f}, Std={std_val:.6f}, Min={min_val:.6f}, Max={max_val:.6f}"
-                )
-
-    collect_grad_stats(grads, prefix)
-    log_message("\n".join(stats_message))
-
-
-def save_model(state, save_dir, epoch=None):
-    """Save model checkpoint with absolute path."""
     try:
-        # Convert to absolute path
-        abs_save_dir = os.path.abspath(save_dir)
-        os.makedirs(abs_save_dir, exist_ok=True)
+        with open(data_path, "rb") as f:
+            X_train, y_train, X_eval, y_eval = pickle.load(f)
 
-        if epoch is not None:
-            checkpoints.save_checkpoint(abs_save_dir, state, epoch, keep=3)
-            log_message(f"Saved model checkpoint for epoch {epoch} to {abs_save_dir}")
-        else:
-            checkpoints.save_checkpoint(abs_save_dir, state, 0, keep=1, overwrite=True)
-            log_message(f"Saved final model checkpoint to {abs_save_dir}")
+        log_message(
+            f"Loaded data shapes - X_train: {X_train.shape}, y_train: {y_train.shape}, "
+            f"X_eval: {X_eval.shape}, y_eval: {y_eval.shape}"
+        )
+        return X_train, y_train, X_eval, y_eval
+
     except Exception as e:
-        log_message(f"Error saving model: {str(e)}", level="ERROR")
+        log_message(f"Error loading data: {e}", level="ERROR")
+        raise
 
 
-def train_model(data_path, model_dir, config=None):
-    """Main training function."""
-    if config is None:
-        config = {
-            "batch_size": 32,
-            "num_epochs": 4,
-            "learning_rate": 5e-5,
-            "eval_every": 1,
-            "save_every": 1,
+def create_model_config(args):
+    """Create model configuration from arguments."""
+    config = ModelConfig()
+    config.d_model = args.d_model
+    config.num_heads = args.num_heads
+    config.d_ff = args.d_ff
+    config.num_layers = args.num_layers
+    config.dropout_rate = args.dropout
+    config.learning_rate = args.learning_rate
+    config.max_seq_len = 5000  # Increased to accommodate longer sequences
+
+    return config
+
+
+def save_training_history(history, output_path):
+    """Save training history and create plots."""
+    # Save history as JSON
+    with open(output_path / "training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    # Create plot directory
+    plot_dir = output_path / "plots"
+    plot_dir.mkdir(exist_ok=True)
+
+    # Plot training and validation loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(history["epochs"], history["train_loss"], label="Training Loss")
+    plt.plot(history["epochs"], history["eval_loss"], label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("RMSD Loss")
+    plt.title("RNA Structure Prediction Training Progress")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(plot_dir / "training_loss.png", dpi=300)
+    plt.close()
+
+    log_message(f"Saved training history and plots to {output_path}")
+
+
+def train_model(args):
+    """Train RNA 3D folding model with given arguments."""
+    # Check JAX device
+    device = check_jax_device()
+    log_message(f"Using device: {device}")
+
+    # Set random seed
+    rng = jax.random.PRNGKey(args.seed)
+
+    # Load data
+    X_train, y_train, X_eval, y_eval = load_data(args.data_path)
+
+    # Update the max_seq_len based on actual data
+    max_seq_len = X_train.shape[1]
+    log_message(f"Maximum sequence length in data: {max_seq_len}")
+
+    # Create model configuration
+    config = create_model_config(args)
+    config.max_seq_len = max(config.max_seq_len, max_seq_len)
+    log_message(f"Using max_seq_len: {config.max_seq_len}")
+
+    # Initialize model
+    model = RNAFoldingModel(config)
+    log_message(
+        f"Initialized model with {config.num_layers} transformer layers, "
+        f"{config.d_model} dimensions, {config.num_heads} attention heads"
+    )
+
+    # Create output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = args.model_name if args.model_name else f"rna_transformer_{timestamp}"
+    output_path = Path(args.output_dir) / model_name
+    output_path.mkdir(exist_ok=True, parents=True)
+
+    # Save configuration
+    with open(output_path / "config.json", "w") as f:
+        config_dict = {k: v for k, v in vars(config).items() if not k.startswith("_")}
+        json.dump(config_dict, f, indent=2)
+
+    # Train model
+    log_message(
+        f"Starting training for {args.epochs} epochs with batch size {args.batch_size}"
+    )
+    start_time = time.time()
+
+    # Initialize training history
+    history = {
+        "epochs": [],
+        "train_loss": [],
+        "eval_loss": [],
+        "learning_rate": [],
+        "time_per_epoch": [],
+    }
+
+    try:
+        # Initialize training state
+        batch_size = min(
+            args.batch_size, len(X_train)
+        )  # Ensure batch size isn't larger than dataset
+        input_shape = (batch_size, X_train.shape[1], X_train.shape[2])
+        rng, init_rng = jax.random.split(rng)
+        state = model.create_train_state(
+            init_rng, input_shape, learning_rate=config.learning_rate
+        )
+
+        # Training loop
+        num_batches = len(X_train) // batch_size
+        best_eval_loss = float("inf")
+
+        for epoch in range(args.epochs):
+            epoch_start = time.time()
+
+            # Shuffle training data
+            rng, shuffle_rng = jax.random.split(rng)
+            perm = jax.random.permutation(shuffle_rng, len(X_train))
+            X_train_shuffled = X_train[perm]
+            y_train_shuffled = y_train[perm]
+
+            # Training
+            total_loss = 0.0
+            for batch_idx in tqdm(
+                range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}"
+            ):
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                batch_X = X_train_shuffled[start_idx:end_idx]
+                batch_y = y_train_shuffled[start_idx:end_idx]
+
+                state, loss = RNAFoldingModel.train_step(state, (batch_X, batch_y))
+                total_loss += loss
+
+            avg_train_loss = total_loss / num_batches
+
+            # Evaluation
+            if (epoch + 1) % args.eval_every == 0:
+                eval_loss = 0.0
+                eval_batches = max(1, len(X_eval) // batch_size)
+
+                for batch_idx in range(eval_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(X_eval))
+
+                    # Handle last batch potentially being smaller
+                    if end_idx - start_idx < batch_size:
+                        continue
+
+                    batch_X = X_eval[start_idx:end_idx]
+                    batch_y = y_eval[start_idx:end_idx]
+
+                    loss = RNAFoldingModel.eval_step(state, (batch_X, batch_y))
+                    eval_loss += loss
+
+                avg_eval_loss = eval_loss / eval_batches
+
+                # Save best model
+                if avg_eval_loss < best_eval_loss:
+                    best_eval_loss = avg_eval_loss
+                    with open(output_path / "best_model.pkl", "wb") as f:
+                        pickle.dump(state, f)
+                    log_message(
+                        f"Saved new best model with eval loss: {best_eval_loss:.4f}"
+                    )
+            else:
+                # If not evaluating this epoch, use training loss
+                avg_eval_loss = avg_train_loss
+
+            epoch_time = time.time() - epoch_start
+            log_message(
+                f"Epoch {epoch+1}/{args.epochs} - "
+                f"Train Loss: {avg_train_loss:.4f}, "
+                f"Eval Loss: {avg_eval_loss:.4f}, "
+                f"Time: {epoch_time:.2f}s"
+            )
+
+            # Update history
+            history["epochs"].append(epoch + 1)
+            history["train_loss"].append(float(avg_train_loss))
+            history["eval_loss"].append(float(avg_eval_loss))
+            history["learning_rate"].append(float(config.learning_rate))
+            history["time_per_epoch"].append(float(epoch_time))
+
+            # Periodically save history and checkpoints
+            if (epoch + 1) % 5 == 0:
+                # Save checkpoint
+                with open(output_path / f"checkpoint_epoch_{epoch+1}.pkl", "wb") as f:
+                    pickle.dump(state, f)
+
+                # Save current history
+                save_training_history(history, output_path)
+
+        # Save final model
+        with open(output_path / "final_model.pkl", "wb") as f:
+            pickle.dump(state, f)
+
+        # Save training history
+        save_training_history(history, output_path)
+
+        total_time = time.time() - start_time
+        log_message(f"Training completed in {total_time:.2f} seconds")
+        log_message(f"Best validation loss: {best_eval_loss:.4f}")
+        log_message(f"All models and data saved to {output_path}")
+
+        return {
+            "model_path": str(output_path),
+            "best_loss": float(best_eval_loss),
+            "training_time": total_time,
+            "final_state": state,
         }
 
-    log_message("Starting training with configuration: " + str(config))
+    except Exception as e:
+        log_message(f"Error during training: {e}", level="ERROR")
+        # Try to save current progress if possible
+        try:
+            with open(output_path / "interrupted_model.pkl", "wb") as f:
+                pickle.dump(state, f)
+            save_training_history(history, output_path)
+            log_message(f"Saved interrupted model to {output_path}")
+        except:
+            log_message("Could not save interrupted model", level="ERROR")
+        raise
 
-    # Data preparation
-    data_file = "data/processed/preprocessed_data_final.pkl"
-    if not os.path.exists(data_file):
-        log_message("Loading data...")
-        # _, y_train, _ = prepare_data(data_path)
-        return None
-    else:
-        with open(data_file, "rb") as f:
-            X_train, y_train, X_eval, y_eval = pickle.load(f)
-    # ---------- Model Initialization ---------
-    log_message("Initializing model...")
-    model = ProteinTransformer(max_len=X_train.shape[1])
-    rng = jax.random.PRNGKey(0)
-    init_rng, dropout_rng = jax.random.split(rng)
 
-    dummy_x_combined = X_train[:1]
-    params = model.init({"params": init_rng, "dropout": dropout_rng}, dummy_x_combined)[
-        "params"
-    ]
+def main():
+    """Main function to run training."""
+    # Parse arguments
+    args = parse_args()
 
-    # Set up optimizer with better stability
-    learning_rate = config["learning_rate"]
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),  # Stronger gradient clipping
-        optax.scale_by_adam(
-            b1=0.9, b2=0.999, eps=1e-8
-        ),  # Adam optimizer with good defaults
-        optax.scale(-learning_rate),  # Learning rate
-    )
-    state = train_state.TrainState.create(
-        apply_fn=model.apply, params=params, tx=optimizer
-    )
-
-    param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
-    log_message(f"Model initialized with {param_count:,} parameters")
-
-    # ---------- Training Loop ---------
-    batch_size = config.get("batch_size", 16)  # Default to smaller batch size
-    num_epochs = config["num_epochs"]
-
-    log_message(
-        f"Starting training with batch size {batch_size} for {num_epochs} epochs..."
-    )
-
-    for epoch in range(num_epochs):
-        epoch_start = time.time()
-        log_message(f"Starting epoch {epoch + 1}/{num_epochs}")
-
-        # Shuffle training data
-        shuffle_idx = np.random.permutation(len(X_train))
-        X_train_shuffled = X_train[shuffle_idx]
-        y_train_shuffled = y_train[shuffle_idx]
-
-        num_complete_batches = len(X_train) // batch_size
-        epoch_loss = 0.0
-        batch_losses = []
-
-        with tqdm(total=num_complete_batches, desc=f"Training epoch {epoch+1}") as pbar:
-            for i in range(0, len(X_train) - batch_size + 1, batch_size):
-                batch_x_combined = X_train_shuffled[i : i + batch_size]
-                batch_y = y_train_shuffled[i : i + batch_size]
-
-                rng, dropout_rng = jax.random.split(rng)
-                state, train_loss, batch_grads = train_step(
-                    state, batch_x_combined, batch_y, dropout_rng
-                )
-
-                # Save batch gradients for analysis
-                if i == 0:
-                    epoch_grads = batch_grads
-
-                batch_loss = float(train_loss)
-                batch_losses.append(batch_loss)
-                epoch_loss += batch_loss
-                avg_loss = epoch_loss / (pbar.n + 1)
-
-                pbar.set_postfix({"batch_loss": batch_loss, "avg_loss": avg_loss})
-                pbar.update(1)
-
-        # Log gradient statistics
-        log_message(
-            f"Epoch {epoch+1} average training loss: {epoch_loss / num_complete_batches:.6f}"
-        )
-        log_gradient_stats(epoch_grads)
-
-        # Check for NaN loss and break if found
-        if jnp.isnan(epoch_loss):
-            log_message("Detected NaN loss, stopping training early", level="WARNING")
-            break
-
-        # Evaluation
-        if (epoch + 1) % config["eval_every"] == 0:
-            log_message("Running evaluation...")
-            eval_losses = []
-
-            # Process evaluation data in batches
-            eval_batch_size = min(batch_size, len(X_eval))
-            for i in range(0, len(X_eval) - eval_batch_size + 1, eval_batch_size):
-                eval_X_batch = X_eval[i : i + eval_batch_size]
-                eval_y_batch = y_eval[i : i + eval_batch_size]
-                eval_loss = float(eval_step(state, eval_X_batch, eval_y_batch))
-                eval_losses.append(eval_loss)
-
-            avg_eval_loss = np.mean(eval_losses) if eval_losses else 0.0
-            log_message(f"Epoch {epoch+1} evaluation loss: {avg_eval_loss:.6f}")
-
-        # Save model checkpoint
-        if (epoch + 1) % config["save_every"] == 0:
-            save_model(state, model_dir, epoch + 1)
-
-        # Print epoch summary
-        epoch_time = time.time() - epoch_start
-        log_message(f"Epoch {epoch+1} completed in {epoch_time:.2f}s")
-
-    # Save final model
-    save_model(state, model_dir)
-    log_message("Training completed!")
-
-    return state
+    # Train model
+    train_model(args)
 
 
 if __name__ == "__main__":
-    # Set configuration variables directly
-    data_path = "data/processed/preprocessed_data.pkl"  # Set this to your data path
-    model_dir = "./models"  # Output directory for model
-
-    config = {
-        "batch_size": 32,
-        "num_epochs": 4,
-        "learning_rate": 5e-5,
-        "eval_every": 1,
-        "save_every": 1,
-    }
-
-    log_message("Starting training with direct configuration")
-    train_model(data_path, model_dir, config)
+    main()
