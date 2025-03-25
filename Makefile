@@ -29,7 +29,7 @@ preprocess:
 
 # Train the model
 train:
-	@python3 -m src.model.train
+	@python3 -m src.model.train --d_model 256 --num_heads 8 --num_layers 6 --batch_size 64 --epochs 50 --learning_rate 5e-4
 
 # Make predictions on the test data
 predict:
