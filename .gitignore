@@ -9,4 +9,5 @@ __pycache__/
 notebooks/.ipynb_checkpoints/
 
 src/instadeep/*
+models/*
 setup.py
