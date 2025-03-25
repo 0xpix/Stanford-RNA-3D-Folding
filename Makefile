@@ -1,3 +1,7 @@
+# Just to test
+handle:
+	@python -m src.data.data_handle
+
 #---------------------------------------------------
 # Targets to run the model pipeline
 #---------------------------------------------------
@@ -21,11 +25,11 @@ download:
 
 # Preprocess the data
 preprocess:
-	@python -m src.preprocess.preprocess
+	@python src.preprocess.preprocess
 
 # Train the model
 train:
-	@python -m src.model.train
+	@python3 -m src.model.train
 
 # Make predictions on the test data
 predict:
@@ -50,7 +54,7 @@ zrok-access:
 	@echo "Zrok Access"
 # @zrok disable
 	@zrok enable "sTi4BOxak4Ox"
-	@zrok access private fqo3t0n4tgx1
+	@zrok access private lyj5ps95om2p
 
 ssh-kaggle:
 	@echo "SSH into Kaggle"
