@@ -42,9 +42,18 @@ def train_step(state, batch_x_combined, batch_y, rng):
     grads = jax.grad(loss_fn)(state.params)
 
     # Check for NaN or infinity in gradients and replace with zeros
-    grads = jax.tree_map(
-        lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads
-    )
+    # Fix deprecated jax.tree_map
+    try:
+        import jax.tree as tree
+
+        grads = tree.map(
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads
+        )
+    except ImportError:
+        # Fallback for older JAX versions
+        grads = jax.tree_util.tree_map(
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads
+        )
 
     loss = loss_fn(state.params)
     new_state = state.apply_gradients(grads=grads)
@@ -149,7 +158,7 @@ def train_model(data_path, model_dir, config=None):
     log_message(f"Model initialized with {param_count:,} parameters")
 
     # ---------- Training Loop ---------
-    batch_size = config["batch_size"]
+    batch_size = config.get("batch_size", 16)  # Default to smaller batch size
     num_epochs = config["num_epochs"]
 
     log_message(
