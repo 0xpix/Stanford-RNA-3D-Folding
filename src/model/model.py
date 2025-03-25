@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.linen import remat
 
 # Define hyperparameters
 vocab_size = 5  # 4 RNA bases (A, U, C, G) + 1 for padding (0)
@@ -8,41 +9,94 @@ num_filters = 64
 kernel_size = 3
 drop_rate = 0.2
 
-class CNNRNAFolding(nn.Module):
-    max_len: int  # Maximum sequence length
 
-    def setup(self):
-        # Embedding layer
-        self.embedding = nn.Embed(num_embeddings=vocab_size, features=embedding_dim)
+class TransformerBlock(nn.Module):
+    """A single transformer block implemented as a Module."""
 
-        # First convolutional block
-        self.conv1 = nn.Conv(features=num_filters, kernel_size=(kernel_size,))
-        self.bn1 = nn.BatchNorm()  # ✅ Removed `use_running_average`
-        self.dropout1 = nn.Dropout(rate=drop_rate)
+    d_model: int
+    num_heads: int
+    dropout_rate: float
 
-        # Second convolutional block
-        self.conv2 = nn.Conv(features=num_filters, kernel_size=(kernel_size,))
-        self.bn2 = nn.BatchNorm()  # ✅ Removed `use_running_average`
-        self.dropout2 = nn.Dropout(rate=drop_rate)
+    @nn.compact
+    def __call__(self, inputs, deterministic=True):
+        # Self-attention
+        attn_output = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate,
+            deterministic=deterministic,
+        )(inputs, inputs)
+        x = inputs + nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(
+            attn_output
+        )
+        x = nn.LayerNorm()(x)
 
-        # Final output layer for 3D coordinates
-        self.output_layer = nn.Conv(features=3, kernel_size=(1,))
-
-    def __call__(self, x, train=True):
-        use_running_average = not train  # ✅ Automatically infer
-
-        x = self.embedding(x)
-
-        # First conv block
-        x = nn.relu(self.conv1(x))
-        x = self.bn1(x, use_running_average=use_running_average)  # ✅ Now works correctly
-        x = self.dropout1(x, deterministic=not train)
-
-        # Second conv block
-        x = nn.relu(self.conv2(x))
-        x = self.bn2(x, use_running_average=use_running_average)  # ✅ Now works correctly
-        x = self.dropout2(x, deterministic=not train)
-
-        # Output (x, y, z) per residue
-        x = self.output_layer(x)
+        # Feed-forward
+        ff_output = nn.Dense(features=self.d_model * 4)(x)
+        ff_output = nn.gelu(ff_output)
+        ff_output = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(
+            ff_output
+        )
+        ff_output = nn.Dense(features=self.d_model * 2)(ff_output)
+        x = x + nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(
+            ff_output
+        )
+        x = nn.LayerNorm()(x)
         return x
+
+
+class ProteinTransformer(nn.Module):
+    d_model: int = 64
+    num_heads: int = 8
+    num_layers: int = 6
+    dropout_rate: float = 0.1
+    max_len: int = 512
+
+    @nn.compact
+    def __call__(self, x_combined, deterministic=True):
+        # Split combined input into sequences and structures
+        x_seq = x_combined[:, :, 0].astype(jnp.int32)
+        x_struct = x_combined[:, :, 1].astype(jnp.int32)
+
+        x_seq_embed = nn.Embed(num_embeddings=5, features=self.d_model)(x_seq)
+        x_struct_embed = nn.Embed(num_embeddings=3, features=self.d_model)(x_struct)
+        x_combined_embed = jnp.concatenate([x_seq_embed, x_struct_embed], axis=-1)
+
+        positions = jnp.arange(self.max_len)[None, :]
+        pos_embed = nn.Embed(num_embeddings=self.max_len, features=self.d_model * 2)(
+            positions
+        )
+        x = x_combined_embed + pos_embed
+        x = nn.LayerNorm()(x)  # Initial normalization
+
+        # Apply transformer blocks
+        for i in range(self.num_layers):
+            # Create a non-remat version first
+            block = TransformerBlock(
+                d_model=self.d_model * 2,
+                num_heads=self.num_heads,
+                dropout_rate=self.dropout_rate,
+                name=f"transformer_block_{i}",
+            )
+
+            # Create a custom function that bakes in the deterministic parameter
+            if deterministic:
+                # For evaluation (deterministic=True)
+                block_fn = lambda x: block(x, deterministic=True)
+            else:
+                # For training (deterministic=False)
+                block_fn = lambda x: block(x, deterministic=False)
+
+            # Apply remat to this function
+            remat_block = remat(block_fn)
+            x = remat_block(x)
+
+        # Final projection
+        x = nn.LayerNorm()(x)
+        coords = nn.Dense(
+            features=3,
+            kernel_init=nn.initializers.variance_scaling(
+                scale=0.02, mode="fan_in", distribution="truncated_normal"
+            ),
+        )(x)
+
+        return coords
