@@ -2,7 +2,7 @@
 This script processes raw RNA sequence and structure data into a format suitable for training a neural network.
 Source: https://www.kaggle.com/code/olaflundstrom/stanford-rna-3d-folding-competition-notebook#3.-Data-Preprocessing
 """
-# process.py
+
 import pickle
 
 import pandas as pd
@@ -12,11 +12,13 @@ import jax.numpy as jnp
 from src.utils import log_message, check_jax_device
 
 # 🔹 Mapping RNA nucleotides to integers
-nucleotide_map = {'A': 1, 'C': 2, 'G': 3, 'U': 4}
+nucleotide_map = {"A": 1, "C": 2, "G": 3, "U": 4}
+
 
 def encode_sequence(seq):
     """Encodes an RNA sequence into a JAX array of integers."""
     return jnp.array([nucleotide_map.get(ch, 0) for ch in seq], dtype=jnp.int32)
+
 
 def process_labels(labels_df):
     """
@@ -43,6 +45,7 @@ def process_labels(labels_df):
 
     return label_dict
 
+
 def create_dataset(sequences_df, labels_dict):
     """
     Creates a dataset: X (encoded RNA sequences), y (3D coordinates), target_ids.
@@ -50,13 +53,14 @@ def create_dataset(sequences_df, labels_dict):
     X, y, target_ids = [], [], []
 
     for _, row in sequences_df.iterrows():
-        tid = row['target_id']
+        tid = row["target_id"]
         if tid in labels_dict:
-            X.append(encode_sequence(row['sequence']))
+            X.append(encode_sequence(row["sequence"]))
             y.append(labels_dict[tid])
             target_ids.append(tid)
 
     return X, y, target_ids
+
 
 def pad_sequences_jax(sequences, max_len):
     """
@@ -65,9 +69,10 @@ def pad_sequences_jax(sequences, max_len):
     padded_sequences = jnp.zeros((len(sequences), max_len), dtype=jnp.int32)
 
     for i, seq in enumerate(sequences):
-        padded_sequences = padded_sequences.at[i, :len(seq)].set(seq)
+        padded_sequences = padded_sequences.at[i, : len(seq)].set(seq)
 
     return padded_sequences
+
 
 def pad_coordinates_jax(coord_array, max_len):
     """
@@ -76,8 +81,9 @@ def pad_coordinates_jax(coord_array, max_len):
     L = coord_array.shape[0]
     if L < max_len:
         pad_width = ((0, max_len - L), (0, 0))  # Only pad along first axis
-        return jnp.pad(coord_array, pad_width, mode='constant', constant_values=0)
+        return jnp.pad(coord_array, pad_width, mode="constant", constant_values=0)
     return coord_array
+
 
 if __name__ == "__main__":
     log_message("🧬 Data processing started!")
