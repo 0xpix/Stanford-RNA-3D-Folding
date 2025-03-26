@@ -3,7 +3,6 @@ Training script for RNA 3D structure prediction model.
 """
 
 import pickle
-import argparse
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,59 +19,26 @@ from src.utils.utils import log_message, check_jax_device
 from flax.training import train_state  # Import train_state
 
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Train RNA 3D structure prediction model"
-    )
+# Data parameters
+DATA_PATH = "data/processed/preprocessed_data_final.pkl"
 
-    # Data parameters
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default="data/processed/preprocessed_data_final.pkl",
-        help="Path to preprocessed data",
-    )
+# Model parameters
+D_MODEL = 16
+NUM_HEADS = 1
+D_FF = 512
+NUM_LAYERS = 4
+DROPOUT = 0.1
 
-    # Model parameters
-    parser.add_argument(
-        "--d_model", type=int, default=128, help="Dimension of transformer model"
-    )
-    parser.add_argument(
-        "--num_heads", type=int, default=8, help="Number of attention heads"
-    )
-    parser.add_argument(
-        "--d_ff", type=int, default=512, help="Dimension of feed-forward network"
-    )
-    parser.add_argument(
-        "--num_layers", type=int, default=4, help="Number of transformer layers"
-    )
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+# Training parameters
+BATCH_SIZE = 1
+EPOCHS = 2
+LEARNING_RATE = 1e-3
+SEED = 42
+EVAL_EVERY = 1
 
-    # Training parameters
-    parser.add_argument(
-        "--batch_size", type=int, default=32, help="Batch size for training"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=30, help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=1e-3, help="Initial learning rate"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--eval_every", type=int, default=1, help="Evaluate every N epochs"
-    )
-
-    # Output parameters
-    parser.add_argument(
-        "--output_dir", type=str, default="models", help="Directory to save models"
-    )
-    parser.add_argument(
-        "--model_name", type=str, default=None, help="Model name (default: timestamp)"
-    )
-
-    return parser.parse_args()
+# Output parameters
+OUTPUT_DIR = "models"
+MODEL_NAME = None  # Will use timestamp if None
 
 
 def load_data(data_path):
@@ -94,15 +60,15 @@ def load_data(data_path):
         raise
 
 
-def create_model_config(args):
-    """Create model configuration from arguments."""
+def create_model_config():
+    """Create model configuration from parameters."""
     config = ModelConfig()
-    config.d_model = args.d_model
-    config.num_heads = args.num_heads
-    config.d_ff = args.d_ff
-    config.num_layers = args.num_layers
-    config.dropout_rate = args.dropout
-    config.learning_rate = args.learning_rate
+    config.d_model = D_MODEL
+    config.num_heads = NUM_HEADS
+    config.d_ff = D_FF
+    config.num_layers = NUM_LAYERS
+    config.dropout_rate = DROPOUT
+    config.learning_rate = LEARNING_RATE
     config.max_seq_len = 5000  # Increased to accommodate longer sequences
 
     return config
@@ -211,24 +177,24 @@ def load_model_params(model, params_path, learning_rate=1e-3, rng=None):
     )
 
 
-def train_model(args):
-    """Train RNA 3D folding model with given arguments."""
+def train_model():
+    """Train RNA 3D folding model with given parameters."""
     # Check JAX device
     device = check_jax_device()
     log_message(f"Using device: {device}")
 
     # Set random seed
-    rng = jax.random.PRNGKey(args.seed)
+    rng = jax.random.PRNGKey(SEED)
 
     # Load data
-    X_train, y_train, X_eval, y_eval = load_data(args.data_path)
+    X_train, y_train, X_eval, y_eval = load_data(DATA_PATH)
 
     # Update the max_seq_len based on actual data
     max_seq_len = X_train.shape[1]
     log_message(f"Maximum sequence length in data: {max_seq_len}")
 
     # Create model configuration
-    config = create_model_config(args)
+    config = create_model_config()
     config.max_seq_len = max(config.max_seq_len, max_seq_len)
     log_message(f"Using max_seq_len: {config.max_seq_len}")
 
@@ -241,8 +207,8 @@ def train_model(args):
 
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_name = args.model_name if args.model_name else f"rna_transformer_{timestamp}"
-    output_path = Path(args.output_dir) / model_name
+    model_name = MODEL_NAME if MODEL_NAME else f"rna_transformer_{timestamp}"
+    output_path = Path(OUTPUT_DIR) / model_name
     output_path.mkdir(exist_ok=True, parents=True)
 
     # Save configuration
@@ -251,9 +217,7 @@ def train_model(args):
         json.dump(config_dict, f, indent=2)
 
     # Train model
-    log_message(
-        f"Starting training for {args.epochs} epochs with batch size {args.batch_size}"
-    )
+    log_message(f"Starting training for {EPOCHS} epochs with batch size {BATCH_SIZE}")
     start_time = time.time()
 
     # Initialize training history
@@ -268,7 +232,7 @@ def train_model(args):
     try:
         # Initialize training state
         batch_size = min(
-            args.batch_size, len(X_train)
+            BATCH_SIZE, len(X_train)
         )  # Ensure batch size isn't larger than dataset
         input_shape = (batch_size, X_train.shape[1], X_train.shape[2])
         rng, init_rng = jax.random.split(rng)
@@ -280,7 +244,7 @@ def train_model(args):
         num_batches = len(X_train) // batch_size
         best_eval_loss = float("inf")
 
-        for epoch in range(args.epochs):
+        for epoch in range(EPOCHS):
             epoch_start = time.time()
 
             # Shuffle training data
@@ -291,9 +255,7 @@ def train_model(args):
 
             # Training
             total_loss = 0.0
-            for batch_idx in tqdm(
-                range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}"
-            ):
+            for batch_idx in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{EPOCHS}"):
                 start_idx = batch_idx * batch_size
                 end_idx = start_idx + batch_size
                 batch_X = X_train_shuffled[start_idx:end_idx]
@@ -305,7 +267,7 @@ def train_model(args):
             avg_train_loss = total_loss / num_batches
 
             # Evaluation
-            if (epoch + 1) % args.eval_every == 0:
+            if (epoch + 1) % EVAL_EVERY == 0:
                 eval_loss = 0.0
                 eval_batches = max(1, len(X_eval) // batch_size)
 
@@ -338,7 +300,7 @@ def train_model(args):
 
             epoch_time = time.time() - epoch_start
             log_message(
-                f"Epoch {epoch+1}/{args.epochs} - "
+                f"Epoch {epoch+1}/{EPOCHS} - "
                 f"Train Loss: {avg_train_loss:.4f}, "
                 f"Eval Loss: {avg_eval_loss:.4f}, "
                 f"Time: {epoch_time:.2f}s"
@@ -395,11 +357,8 @@ def train_model(args):
 
 def main():
     """Main function to run training."""
-    # Parse arguments
-    args = parse_args()
-
-    # Train model
-    train_model(args)
+    # Train model directly using the defined variables
+    train_model()
 
 
 if __name__ == "__main__":
