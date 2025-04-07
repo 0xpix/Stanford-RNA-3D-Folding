@@ -325,7 +325,7 @@ if __name__ == "__main__":
 
     # 🔹 Save processed data
     log_message("Saving processed data")
-    with open("data/processed/processed_data.pkl", "wb") as f:
+    with open("data/processed/processed_data_msa_bppm.pkl", "wb") as f:
         pickle.dump(
             (
                 X_train_pad, y_train_pad, msas_train_pad, bppms_train_pad,
