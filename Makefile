@@ -24,8 +24,8 @@ download:
 	@python -m src.data.download
 
 # Preprocess the data
-preprocess:
-	@python src.preprocess.preprocess
+preprocess-rna:
+	@python -m src.preprocess.preprocess
 
 # Train the model
 train:
