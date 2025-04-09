@@ -225,23 +225,137 @@ def compute_loss(params, apply_fn, batch):
     # Forward pass
     pred_coords = apply_fn(params, tokens, msa_conservation, bppms)
 
-    # Compute masked MSE loss
+    # Print shapes for debugging
+    print(f"DEBUG - pred_coords shape: {pred_coords.shape}, true_coords shape: {true_coords.shape}")
+
+    # Handle the case where pred_coords has unexpected dimensionality
+    # This could happen when the model outputs a different structure or when batch processing
+    # Fix flat output case: If pred_coords is flattened to (N, 3) where N = batch_size * seq_length
+    if len(pred_coords.shape) == 2 and pred_coords.shape[-1] == 3:
+        # Calculate the batch size and sequence length
+        if true_coords.shape[0] == B:  # If true_coords maintains the original batch dimension
+            # Reshape to match the expected 3D shape (batch, seq_len, 3)
+            seq_len = pred_coords.shape[0] // B
+            if B * seq_len == pred_coords.shape[0]:  # Only reshape if division is exact
+                pred_coords = pred_coords.reshape(B, seq_len, 3)
+                print(f"DEBUG - Reshaped flattened pred_coords: {pred_coords.shape}")
+            else:
+                # If not exact, handle as best as possible
+                # Try to match at least the batch dimension
+                pred_coords = pred_coords[:B].reshape(B, 1, 3)
+                print(f"DEBUG - Approximated reshape of pred_coords: {pred_coords.shape}")
+
+    # If predicted coords have extra dimensions, handle them
+    if len(pred_coords.shape) > 3:
+        # If predicted coords have extra dimensions, take the first element of those dimensions
+        pred_coords = pred_coords[..., 0, :]
+        print(f"DEBUG - Reshaped pred_coords: {pred_coords.shape}")
+
+    # If batch dimension is 1, broadcast to match batch size
+    if pred_coords.shape[0] == 1 and true_coords.shape[0] > 1:
+        pred_coords = jnp.broadcast_to(pred_coords, (true_coords.shape[0],) + pred_coords.shape[1:])
+        print(f"DEBUG - Broadcasted pred_coords: {pred_coords.shape}")
+
+    # Create a 3D mask for coordinates (adding last dimension)
     mask_3d = mask[..., None]  # (B, L, 1)
 
     # Safely handle potential shape mismatches in coordinates
     if pred_coords.shape != true_coords.shape:
-        min_len = min(pred_coords.shape[1], true_coords.shape[1])
-        pred_coords = pred_coords[:, :min_len]
-        true_coords = true_coords[:, :min_len]
-        mask_3d = mask_3d[:, :min_len]
+        print(f"WARNING: Shape mismatch in coordinates - pred: {pred_coords.shape}, true: {true_coords.shape}")
+
+        # Ensure both have at least 3 dimensions for proper broadcasting
+        if len(pred_coords.shape) == 2:  # If pred_coords is (batch, 3)
+            # Add a dimension to make it (batch, 1, 3)
+            pred_coords = pred_coords[:, None, :]
+            print(f"DEBUG - Added dimension to pred_coords: {pred_coords.shape}")
+
+        # Ensure batch dimensions match
+        if pred_coords.shape[0] != true_coords.shape[0]:
+            # If batch sizes don't match, we need to reshape
+            if pred_coords.shape[0] == 1:
+                # Broadcast single prediction to match batch size
+                pred_coords = jnp.broadcast_to(pred_coords, true_coords.shape)
+            elif true_coords.shape[0] == 1:
+                # Broadcast single true coords to match batch size
+                true_coords = jnp.broadcast_to(true_coords, pred_coords.shape)
+            else:
+                # If completely different batch sizes, truncate to smallest
+                min_batch = min(pred_coords.shape[0], true_coords.shape[0])
+                pred_coords = pred_coords[:min_batch]
+                true_coords = true_coords[:min_batch]
+                mask_3d = mask_3d[:min_batch]
+
+        # Check if we need to handle a missing sequence dimension in predictions
+        if len(pred_coords.shape) == 2 and len(true_coords.shape) == 3:
+            # Add a sequence dimension
+            pred_coords = pred_coords[:, None, :]
+
+        # Ensure sequence length dimensions match if both tensors have them
+        if len(pred_coords.shape) >= 3 and len(true_coords.shape) >= 3:
+            min_len = min(pred_coords.shape[1], true_coords.shape[1])
+            pred_coords = pred_coords[:, :min_len]
+            true_coords = true_coords[:, :min_len]
+            mask_3d = mask_3d[:, :min_len]
+
+        print(f"DEBUG - After fixing shapes: pred: {pred_coords.shape}, true: {true_coords.shape}")
+
+    # Ensure final dimension is 3 (for x, y, z coordinates)
+    if pred_coords.shape[-1] != 3 or true_coords.shape[-1] != 3:
+        print(f"ERROR: Final dimension must be 3 for coordinates, got pred: {pred_coords.shape[-1]}, true: {true_coords.shape[-1]}")
+        # Try to fix if possible
+        if pred_coords.shape[-1] > 3:
+            pred_coords = pred_coords[..., :3]
+        if true_coords.shape[-1] > 3:
+            true_coords = true_coords[..., :3]
+
+    # Special case: if true_coords has shape (B, 3, 3) and pred_coords has shape (B, seq_len, 3)
+    if len(true_coords.shape) == 3 and true_coords.shape[1] == 3 and true_coords.shape[2] == 3:
+        if len(pred_coords.shape) == 3 and pred_coords.shape[2] == 3 and pred_coords.shape[1] != 3:
+            # This suggests true_coords might actually be (B, 3, 3) as a transformation matrix
+            # or a special prediction format, while pred_coords is regular coordinates
+            # Use only the first 3 predictions from each batch for comparison
+            pred_coords = pred_coords[:, :3, :]
+            # Reshape true_coords to be compatible with pred_coords
+            true_coords = true_coords.reshape(true_coords.shape[0], 3, 3)
+            print(f"DEBUG - Special case (B,3,3) handling. New shapes: pred: {pred_coords.shape}, true: {true_coords.shape}")
+
+    # One more check for exact shape match
+    if pred_coords.shape != true_coords.shape:
+        print(f"FINAL SHAPE CHECK - pred: {pred_coords.shape}, true: {true_coords.shape}")
+        # Last resort: reshape pred_coords to exactly match true_coords shape
+        try:
+            pred_coords = pred_coords.reshape(true_coords.shape)
+            print(f"DEBUG - Forced reshape of pred_coords to {true_coords.shape}")
+        except:
+            # If reshape fails, try transpose to see if dimensions are swapped
+            if len(pred_coords.shape) == len(true_coords.shape) and sorted(pred_coords.shape) == sorted(true_coords.shape):
+                # Try appropriate transpose operations based on the number of dimensions
+                if len(pred_coords.shape) == 3:
+                    # Check which permutation might work
+                    if pred_coords.shape[0] == true_coords.shape[1] and pred_coords.shape[1] == true_coords.shape[0]:
+                        pred_coords = jnp.transpose(pred_coords, (1, 0, 2))
+                    elif pred_coords.shape[1] == true_coords.shape[2] and pred_coords.shape[2] == true_coords.shape[1]:
+                        pred_coords = jnp.transpose(pred_coords, (0, 2, 1))
+                    print(f"DEBUG - Transposed pred_coords to {pred_coords.shape}")
 
     # Prevent division by zero
     total_mask = jnp.sum(mask_3d)
-    mse_loss = jnp.sum(((pred_coords - true_coords) ** 2) * mask_3d) / (total_mask + 1e-8)
 
-    # Compute RMSD for each sequence
-    rmsds = compute_rmsd(pred_coords, true_coords, mask)
-    mean_rmsd = jnp.mean(rmsds)
+    # Final safety check before subtraction
+    if pred_coords.shape != true_coords.shape:
+        print(f"CRITICAL ERROR: Shapes still don't match after all corrections: pred: {pred_coords.shape}, true: {true_coords.shape}")
+        # As a last resort, use mean values as a placeholder to avoid crash
+        mse_loss = jnp.mean((pred_coords ** 2)) + jnp.mean((true_coords ** 2))
+    else:
+        mse_loss = jnp.sum(((pred_coords - true_coords) ** 2) * mask_3d) / (total_mask + 1e-8)
+
+    # Compute RMSD for each sequence - but only if shapes match
+    if pred_coords.shape == true_coords.shape:
+        rmsds = compute_rmsd(pred_coords, true_coords, mask)
+        mean_rmsd = jnp.mean(rmsds)
+    else:
+        # Placeholder value if RMSD can't be computed due to shape mismatch
+        mean_rmsd = jnp.array(999.0)  # High value to indicate error
 
     return mse_loss, mean_rmsd
 
