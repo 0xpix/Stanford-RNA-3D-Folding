@@ -183,122 +183,116 @@ class RNAEncoder(nn.Module):
 
 
 
-# === Biologically-informed RNA graph creation ===
-def make_rna_graph(batch_embeddings, bppms, threshold=0.1, max_edges_per_node=None):
+# === Fully JIT-compatible RNA graph creation (no dynamic shapes or boolean indexing) ===
+def make_rna_graph(batch_embeddings, bppms, threshold=0.1, max_edges=5000):
     """
-    Converts batch of embeddings + BPPMs to a GraphsTuple.
-    Each sequence becomes one graph.
+    Creates an RNA graph representation that is fully compatible with JAX's JIT compilation.
+    Avoids all operations that could lead to dynamic shapes or boolean indexing.
 
-    Preserves biologically meaningful interactions while managing memory use.
+    Args:
+        batch_embeddings: Node features from encoder [batch_size, seq_len, hidden_dim]
+        bppms: Base-pairing probability matrices [batch_size, seq_len, seq_len]
+        threshold: Probability threshold for including base pairs
+        max_edges: Maximum number of edges per graph (for memory efficiency)
+
+    Returns:
+        A batched GraphsTuple representation of the RNA structures
     """
     graphs = []
+
     for node_features, bppm in zip(batch_embeddings, bppms):
         n_node = node_features.shape[0]
 
-        # For RNA, we need to capture:
-        # 1. Local interactions (sequential neighbors)
-        # 2. Base pairing interactions (from BPPM)
-        # 3. Important tertiary contacts
+        # Step 1: Always include backbone connections (fixed size, JIT-friendly)
+        # Create indices for neighboring positions in the sequence
+        backbone_src = jnp.arange(n_node - 1)  # 0 to n-2
+        backbone_dst = backbone_src + 1        # 1 to n-1
 
-        # Determine appropriate edge strategy based on sequence length
-        if n_node > 2048:
-            # For extremely long sequences
-            # Use hierarchical approach with three classes of edges:
+        # Also add reverse edges
+        backbone_srcs = jnp.concatenate([backbone_src, backbone_dst])
+        backbone_dsts = jnp.concatenate([backbone_dst, backbone_src])
 
-            # 1. Keep all sequential neighbors (backbone connections)
-            seq_senders = jnp.arange(n_node-1)
-            seq_receivers = jnp.arange(1, n_node)
+        # Fixed number of backbone edges: 2 * (n_node - 1)
+        backbone_edge_count = len(backbone_srcs)
 
-            # Create bi-directional edges
-            backbone_senders = jnp.concatenate([seq_senders, seq_receivers])
-            backbone_receivers = jnp.concatenate([seq_receivers, seq_senders])
+        # Step 2: Create a fixed number of base-pairing edges
+        # Instead of using boolean masking, we'll:
+        # 1. Determine max number of base-pairing edges to include
+        # 2. Create dummy values that will be updated
+        # 3. Top-k approach for selecting edges
 
-            # 2. Keep strong base pairs from BPPM (likely secondary structure)
-            # Use higher threshold for very long sequences
-            sec_threshold = max(threshold, 0.25)
-            sec_senders, sec_receivers = jnp.where(bppm > sec_threshold)
+        # Determine number of base-pairing edges to include beyond backbone
+        remaining_edges = max(0, min(max_edges - backbone_edge_count, n_node * 10))
 
-            # 3. Add tertiary contacts with very high probability
-            tert_threshold = 0.5  # Only very confident tertiary interactions
-            tert_senders, tert_receivers = jnp.where((bppm > tert_threshold) & (jnp.abs(jnp.arange(n_node)[:, None] - jnp.arange(n_node)[None, :]) > 4))
+        # Initialize dummy values for base-pairing edges
+        bp_srcs = jnp.zeros(remaining_edges, dtype=jnp.int32)
+        bp_dsts = jnp.zeros(remaining_edges, dtype=jnp.int32)
+        bp_scores = jnp.zeros(remaining_edges, dtype=jnp.float32)
 
-            # Combine all types of edges
-            senders = jnp.concatenate([backbone_senders, sec_senders, tert_senders])
-            receivers = jnp.concatenate([backbone_receivers, sec_receivers, tert_receivers])
+        # To select the highest probability base pairs without boolean indexing,
+        # we'll use a scan function that iteratively builds the edge list
+        def scan_fn(carry, idx):
+            i = idx // n_node
+            j = idx % n_node
 
-        elif n_node > 1024:
-            # For long sequences, use a base-pairing cutoff with backbone guarantee
-            # 1. Always include backbone connections
-            seq_senders = jnp.arange(n_node-1)
-            seq_receivers = jnp.arange(1, n_node)
+            # Current state
+            srcs, dsts, scores, count = carry
 
-            # Create bi-directional backbone edges
-            backbone_senders = jnp.concatenate([seq_senders, seq_receivers])
-            backbone_receivers = jnp.concatenate([seq_receivers, seq_senders])
+            # Conditions for valid edge:
+            # 1. Above threshold
+            # 2. Not a backbone edge (must be separated by at least 2 positions)
+            # 3. Still have space in our edge list
+            prob = bppm[i, j]
+            valid_edge = (prob > threshold) & (jnp.abs(i - j) > 2) & (count < remaining_edges)
 
-            # 2. Include base pairing information from BPPM
-            # Use adaptive threshold based on sequence length
-            adaptive_threshold = max(threshold, 0.15)
-            bp_senders, bp_receivers = jnp.where(bppm > adaptive_threshold)
+            # Update arrays conditionally
+            new_count = count + jnp.int32(valid_edge)
+            idx_to_update = jnp.minimum(count, remaining_edges - 1)  # Ensure within bounds
 
-            # Combine backbone and base pairing edges
-            senders = jnp.concatenate([backbone_senders, bp_senders])
-            receivers = jnp.concatenate([backbone_receivers, bp_receivers])
+            # Update edge arrays with new edge if valid
+            new_srcs = jax.lax.dynamic_update_index_in_dim(srcs, i, idx_to_update, 0)
+            new_dsts = jax.lax.dynamic_update_index_in_dim(dsts, j, idx_to_update, 0)
+            new_scores = jax.lax.dynamic_update_index_in_dim(scores, prob, idx_to_update, 0)
 
-            # Limit edges if we have too many (but ensure we keep backbone)
-            if max_edges_per_node is not None:
-                edge_limit_total = n_node * max_edges_per_node
-                if len(senders) > edge_limit_total:
-                    # Keep all backbone edges
-                    backbone_count = len(backbone_senders)
+            # Only update if this is a valid edge
+            srcs = jnp.where(valid_edge, new_srcs, srcs)
+            dsts = jnp.where(valid_edge, new_dsts, dsts)
+            scores = jnp.where(valid_edge, new_scores, scores)
 
-                    # For remaining edges, select by probability
-                    remaining_limit = edge_limit_total - backbone_count
-                    if remaining_limit > 0 and len(bp_senders) > 0:
-                        # Get probability values for base pair edges
-                        bp_indices = bp_senders * bppm.shape[1] + bp_receivers
-                        bp_probs = bppm.flatten()[bp_indices]
+            return (srcs, dsts, scores, new_count), None
 
-                        # Sort and keep top base pairs
-                        sorted_indices = jnp.argsort(-bp_probs)
-                        keep_indices = sorted_indices[:remaining_limit]
+        # Start with empty edge lists
+        init_state = (bp_srcs, bp_dsts, bp_scores, jnp.array(0, dtype=jnp.int32))
 
-                        # Final edge set: backbone + top base pairs
-                        bp_senders = bp_senders[keep_indices]
-                        bp_receivers = bp_receivers[keep_indices]
-                        senders = jnp.concatenate([backbone_senders, bp_senders])
-                        receivers = jnp.concatenate([backbone_receivers, bp_receivers])
+        # Only scan through a reasonable number of potential edges
+        # For large sequences, we'll sample a subset of indices
+        if n_node > 1000:
+            # For very large sequences, only check a subset of potential edges
+            # to avoid quadratic computation
+            sample_indices = jnp.linspace(0, n_node*n_node - 1, min(n_node*100, 100000)).astype(jnp.int32)
         else:
-            # Standard approach for shorter sequences
-            # Use BPPM threshold and include backbone
-            basic_senders, basic_receivers = jnp.where(bppm > threshold)
+            # For smaller sequences, check all potential edges
+            sample_indices = jnp.arange(min(n_node*n_node, 100000))
 
-            # Always include backbone connections for biological plausibility
-            seq_senders = jnp.arange(n_node-1)
-            seq_receivers = jnp.arange(1, n_node)
+        # Run the scan
+        (final_srcs, final_dsts, final_scores, _), _ = jax.lax.scan(
+            scan_fn,
+            init_state,
+            sample_indices
+        )
 
-            # Combine the edges
-            senders = jnp.concatenate([basic_senders, seq_senders, seq_receivers])
-            receivers = jnp.concatenate([basic_receivers, seq_receivers, seq_senders])
+        # Step 3: Combine backbone and base-pairing edges
+        senders = jnp.concatenate([backbone_srcs, final_srcs])
+        receivers = jnp.concatenate([backbone_dsts, final_dsts])
 
-            # Remove duplicates by creating a unique edge identifier
-            edge_ids = senders * n_node + receivers
-            unique_ids, indices = jnp.unique(edge_ids, return_index=True)
-            senders = senders[indices]
-            receivers = receivers[indices]
+        # Create edge features - default to 1.0 for backbone, use score for base-pairs
+        backbone_scores = jnp.ones(backbone_edge_count)
+        edge_weights = jnp.concatenate([backbone_scores, final_scores])
 
-        # Create edge features - for RNA we use base pair probabilities as edge weights
-        edge_indices = senders * n_node + receivers
-        flat_bppm = bppm.flatten()
+        # Reshape to add feature dimension
+        edge_weights = edge_weights.reshape(-1, 1)
 
-        # Cap the edge indices to avoid out-of-bounds
-        safe_indices = jnp.minimum(edge_indices, flat_bppm.shape[0]-1)
-        edge_weights = flat_bppm[safe_indices].reshape(-1, 1)
-
-        # Add minimum weight for backbone edges that might have low BPPM
-        min_weight = 0.01
-        edge_weights = jnp.maximum(edge_weights, min_weight)
-
+        # Create the graph
         graph = jraph.GraphsTuple(
             nodes=node_features,
             edges=edge_weights,
@@ -308,9 +302,14 @@ def make_rna_graph(batch_embeddings, bppms, threshold=0.1, max_edges_per_node=No
             n_edge=jnp.array([len(senders)]),
             globals=None
         )
+
         graphs.append(graph)
 
-    return jraph.batch_np(graphs)
+    # Use jraph.batch to combine multiple graphs
+    if len(graphs) > 1:
+        return jraph.batch(graphs)
+    else:
+        return graphs[0]
 
 
 # === Enhanced RNA Feature Processing ===
@@ -335,106 +334,81 @@ class RNAFeatureProcessor(nn.Module):
         return nn.Dense(self.dim)(features)
 
 
-# === Memory-Optimized GNN Refinement Module ===
+# === Simplified, Robust GNN for RNA Structure Prediction ===
 class EnhancedRNAGNN(nn.Module):
-    hidden_dim: int = 128
-    num_message_passing_steps: int = 3
+    """
+    A simplified GNN designed specifically for RNA 3D structure prediction.
+    Avoids shape mismatches by using a more straightforward architecture.
+    """
+    output_dim: int = 3  # 3D coordinates
 
     @nn.compact
     def __call__(self, graph):
-        # Check if this is a very large graph and reduce complexity if needed
-        n_nodes = graph.nodes.shape[0]
-        n_edges = graph.edges.shape[0] if graph.edges is not None else 0
+        # Extract graph components
+        nodes = graph.nodes
+        edges = graph.edges
+        senders = graph.senders
+        receivers = graph.receivers
 
-        # Dynamically adjust hyperparameters based on graph size to save memory
-        if n_nodes > 2000:
-            # For extremely large graphs, reduce hidden dimension and message passing
-            effective_hidden_dim = min(self.hidden_dim, 64)
-            effective_mp_steps = 2  # Fewer message passing steps
-        elif n_nodes > 1000:
-            effective_hidden_dim = min(self.hidden_dim, 96)
-            effective_mp_steps = min(self.num_message_passing_steps, 2)
+        # Get input dimensions
+        node_dim = nodes.shape[-1]
+
+        # Initial node projection - first layer is critical for setting dimensions right
+        # Using a 2-layer MLP for initial node projection
+        h_nodes = nn.Dense(features=128)(nodes)
+        h_nodes = nn.relu(h_nodes)
+        h_nodes = nn.LayerNorm()(h_nodes)
+
+        # First round of message passing (fixed architecture to avoid shape issues)
+        # Step 1: Gather source node features
+        s_nodes = h_nodes[senders]
+
+        # Step 2: Gather target node features
+        t_nodes = h_nodes[receivers]
+
+        # Step 3: Process edge features
+        # Ensure edge features are properly shaped
+        if edges is None:
+            # Create default edge features if none are provided
+            edge_features = jnp.ones((senders.shape[0], 1))
         else:
-            effective_hidden_dim = self.hidden_dim
-            effective_mp_steps = self.num_message_passing_steps
+            edge_features = edges
 
-        # Handle possible empty or invalid graphs
-        if n_edges == 0:
-            # If no edges, directly predict coordinates from node features
-            coords = nn.Sequential([
-                nn.Dense(64),
-                nn.relu,
-                nn.Dense(3)
-            ])(graph.nodes)
-            return coords
+        # Project edges to correct dimension if needed
+        if edge_features.shape[-1] != 64:
+            edge_features = nn.Dense(features=64)(edge_features)
 
-        # Define update functions with memory-efficient operations
-        def update_node_fn(nodes, sent_attrs, received_attrs, globals_):
-            # Safety check for empty received attributes (happens with empty graphs)
-            if received_attrs.shape[0] == 0:
-                return nodes
+        # Step 4: Combine node and edge features for messages
+        # Use simple summation instead of concatenation to avoid shape issues
+        messages = s_nodes * 0.5 + t_nodes * 0.3 + nn.Dense(features=128)(edge_features) * 0.2
+        messages = nn.relu(messages)
 
-            # Ensure compatible shapes
-            if nodes.shape[-1] != received_attrs.shape[-1]:
-                # Project received attributes to match node dimension
-                received_attrs = nn.Dense(nodes.shape[-1])(received_attrs)
+        # Step 5: Aggregate messages - simple summation aggregation
+        # This uses a segment_sum operation which is JIT-friendly
+        aggregated = jraph.segment_sum(messages, receivers, num_segments=nodes.shape[0])
 
-            # Memory-efficient aggregation
-            x = nodes + 0.1 * received_attrs  # Simple weighted sum instead of concatenation
-            x = nn.LayerNorm()(x)  # Normalize for stability
-            x = nn.Dense(effective_hidden_dim)(x)
-            x = nn.relu(x)
+        # Step 6: Update node features with a residual connection
+        h_nodes = h_nodes + nn.Dense(features=128)(aggregated)
+        h_nodes = nn.LayerNorm()(h_nodes)
+        h_nodes = nn.relu(h_nodes)
 
-            return x
+        # Second round of message passing with same architecture
+        s_nodes = h_nodes[senders]
+        t_nodes = h_nodes[receivers]
 
-        def update_edge_fn(edges, sender_nodes, receiver_nodes, globals_):
-            # For very large graphs, use a simplified edge update that's more memory efficient
-            if n_nodes > 2000:
-                # Instead of concatenation, compute a simple weighted sum
-                edge_update = 0.5 * (sender_nodes + receiver_nodes)
-                return nn.Dense(edges.shape[-1])(edge_update)
-            else:
-                # Standard approach for smaller graphs
-                try:
-                    # Make sure all inputs have the same last dimension
-                    if edges.shape[-1] != sender_nodes.shape[-1] or edges.shape[-1] != receiver_nodes.shape[-1]:
-                        # Project to a common dimension
-                        common_dim = min(edges.shape[-1], sender_nodes.shape[-1], receiver_nodes.shape[-1])
-                        edges_proj = nn.Dense(common_dim)(edges)
-                        sender_proj = nn.Dense(common_dim)(sender_nodes)
-                        receiver_proj = nn.Dense(common_dim)(receiver_nodes)
-                        inputs = jnp.concatenate([edges_proj, sender_proj, receiver_proj], axis=-1)
-                    else:
-                        inputs = jnp.concatenate([edges, sender_nodes, receiver_nodes], axis=-1)
+        messages = s_nodes * 0.5 + t_nodes * 0.3 + nn.Dense(features=128)(edge_features) * 0.2
+        messages = nn.relu(messages)
 
-                    x = nn.Dense(effective_hidden_dim // 2)(inputs)
-                    x = nn.relu(x)
-                    return nn.Dense(edges.shape[-1])(x)
-                except Exception as e:
-                    # Fallback in case of shape mismatch
-                    print(f"Warning: Shape mismatch in edge update, using fallback method. Error: {e}")
-                    return edges  # Keep edges unchanged
+        aggregated = jraph.segment_sum(messages, receivers, num_segments=nodes.shape[0])
 
-        # Apply reduced message passing steps for memory efficiency
-        for _ in range(effective_mp_steps):
-            # Use try-except to handle potential shape mismatches
-            try:
-                graph = jraph.GraphNetwork(
-                    update_node_fn=update_node_fn,
-                    update_edge_fn=update_edge_fn,
-                    update_global_fn=None
-                )(graph)
-            except Exception as e:
-                print(f"Warning: Error in graph processing: {e}")
-                # If graph processing fails, skip this step
-                continue
+        h_nodes = h_nodes + nn.Dense(features=128)(aggregated)
+        h_nodes = nn.LayerNorm()(h_nodes)
+        h_nodes = nn.relu(h_nodes)
 
-        # Project to 3D coordinates with a simple MLP
-        coords = nn.Sequential([
-            nn.Dense(64),
-            nn.relu,
-            nn.Dense(3)
-        ])(graph.nodes)
+        # Final MLP to predict 3D coordinates
+        coords = nn.Dense(features=64)(h_nodes)
+        coords = nn.relu(coords)
+        coords = nn.Dense(features=self.output_dim)(coords)
 
         return coords
 
@@ -487,7 +461,8 @@ class RNAFoldingModel(nn.Module):
             # Create graph and apply enhanced GNN (with potential chunking)
             def graph_fn(encoded, bppm):
                 graph = make_rna_graph(encoded, bppm, threshold=threshold)
-                return EnhancedRNAGNN(hidden_dim=min(effective_dim, 96))(graph)
+                # The new EnhancedRNAGNN doesn't take a hidden_dim parameter
+                return EnhancedRNAGNN(output_dim=3)(graph)
 
             if self.use_checkpoint and training:
                 coords = lax.checkpoint(graph_fn, encoded, bppm)
@@ -496,6 +471,7 @@ class RNAFoldingModel(nn.Module):
         else:
             # Standard processing for smaller sequences
             graph = make_rna_graph(encoded, bppm)
-            coords = EnhancedRNAGNN()(graph)
+            # The new EnhancedRNAGNN only takes output_dim
+            coords = EnhancedRNAGNN(output_dim=3)(graph)
 
         return coords
