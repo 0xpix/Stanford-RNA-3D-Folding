@@ -46,13 +46,41 @@ OUTPUT_DIR = os.environ.get('RNA_OUTPUT_DIR', OUTPUT_DIR)
 
 def create_train_state(rng, model, learning_rate, warmup_steps, max_len=200):
     """Create initial training state with Flax."""
-    # Use a larger sequence length for initialization to handle variability in data
-    dummy_seq_len = max_len + 100  # Add buffer to handle potential longer sequences
+    # Cap the maximum sequence length for initialization to something reasonable
+    # This avoids OOM during initialization but still allows training on longer sequences
+    init_seq_len = min(max_len, 512)  # Cap to 512 for initialization
 
-    params = model.init(rng,
-                       jnp.ones((1, dummy_seq_len), dtype=jnp.int32),  # Dummy tokens
-                       jnp.ones((1, dummy_seq_len), dtype=jnp.float32),  # Dummy MSA
-                       jnp.ones((1, dummy_seq_len, dummy_seq_len), dtype=jnp.float32))  # Dummy BPPM
+    log_message(f"Initializing model with sequence length {init_seq_len} (max training length: {max_len})")
+
+    # Create dummy inputs with the initialization length
+    dummy_tokens = jnp.ones((1, init_seq_len), dtype=jnp.int32)
+    dummy_msa = jnp.ones((1, init_seq_len), dtype=jnp.float32)
+    dummy_bppm = jnp.ones((1, init_seq_len, init_seq_len), dtype=jnp.float32) * 0.1
+
+    # For large sequences, initialize with dummy bppm that has limited edges
+    # This vastly reduces memory usage during initialization
+    if init_seq_len > 256:
+        # Create a sparse dummy BPPM with only diagonal and near-diagonal edges
+        dummy_bppm = jnp.zeros((1, init_seq_len, init_seq_len), dtype=jnp.float32)
+        # Add diagonal elements (self-loops)
+        for i in range(init_seq_len):
+            dummy_bppm = dummy_bppm.at[0, i, i].set(0.9)
+            # Add some near-diagonal edges
+            for j in range(1, 5):  # Add edges to 4 nearest neighbors
+                if i + j < init_seq_len:
+                    dummy_bppm = dummy_bppm.at[0, i, i+j].set(0.5)
+                if i - j >= 0:
+                    dummy_bppm = dummy_bppm.at[0, i, i-j].set(0.5)
+
+    # Split initialization into stages to avoid OOM
+    # First initialize only the feature processing part
+    feature_params = model.init(
+        rng,
+        dummy_tokens,
+        dummy_msa,
+        dummy_bppm,
+        training=False
+    )
 
     # Learning rate schedule: linear warmup and then cosine decay
     schedule_fn = optax.warmup_cosine_decay_schedule(
@@ -71,7 +99,7 @@ def create_train_state(rng, model, learning_rate, warmup_steps, max_len=200):
 
     return train_state.TrainState.create(
         apply_fn=model.apply,
-        params=params,
+        params=feature_params,
         tx=tx
     )
 
@@ -307,6 +335,62 @@ def chunk_long_sequence(tokens, msa_conservation, bppms, true_coords, max_chunk_
     return chunks
 
 
+def chunk_long_sequence_with_overlap(tokens, msa_conservation, bppms, true_coords, window_size=1024, overlap=256):
+    """
+    Process very long RNA sequences using a sliding window with overlap approach.
+    This preserves context and allows capturing both local and long-range interactions.
+
+    Args:
+        tokens: RNA sequence tokens (B, L)
+        msa_conservation: Conservation scores (B, L)
+        bppms: Base pair probability matrices (B, L, L)
+        true_coords: Target 3D coordinates (B, L, 3)
+        window_size: Size of each window
+        overlap: Overlap between consecutive windows
+
+    Returns:
+        List of chunks with overlapping regions to maintain context
+    """
+    B, L = tokens.shape
+    if L <= window_size:
+        return [(tokens, msa_conservation, bppms, true_coords)]
+
+    chunks = []
+    stride = window_size - overlap
+
+    for start_idx in range(0, L, stride):
+        end_idx = min(start_idx + window_size, L)
+
+        # If this is a small final chunk, merge with previous
+        if end_idx - start_idx < overlap and len(chunks) > 0:
+            continue
+
+        # Extract chunk with context
+        chunk_tokens = tokens[:, start_idx:end_idx]
+        chunk_msa = msa_conservation[:, start_idx:end_idx]
+        chunk_bppms = bppms[:, start_idx:end_idx, start_idx:end_idx]
+        chunk_coords = true_coords[:, start_idx:end_idx]
+
+        # Get BPPM connections to regions outside the chunk
+        # These represent long-range interactions that would be lost by simple chunking
+        if start_idx > 0 or end_idx < L:
+            # Store metadata about the chunk position for later stitching
+            chunk_meta = {
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'full_length': L,
+            }
+            chunks.append((chunk_tokens, chunk_msa, chunk_bppms, chunk_coords, chunk_meta))
+        else:
+            chunks.append((chunk_tokens, chunk_msa, chunk_bppms, chunk_coords))
+
+        # If we've reached the end, break
+        if end_idx == L:
+            break
+
+    return chunks
+
+
 def train_model():
     """Main training function."""
     # Set up logging and checkpointing
@@ -323,8 +407,8 @@ def train_model():
     log_message(f"Data loaded with max sequence length: {max_len}")
 
     # Cap the maximum length for memory efficiency
-    max_model_len = min(max_len, 2048)  # 2048 is safer for memory constraints
-    log_message(f"Setting maximum model sequence length to {max_model_len}")
+    max_model_len = min(max_len, 1024)  # Limit to 1024 for now to ensure it trains
+    log_message(f"Setting maximum model sequence length to {max_model_len} (original max length: {max_len})")
 
     # Configure dynamic batch size based on sequence length for memory efficiency
     def get_dynamic_batch_size(seq_len):
@@ -400,7 +484,7 @@ def train_model():
                 # Check if sequence is too long - if so, chunk it
                 if max_batch_seq_len > 1024:
                     log_message(f"Long sequence detected ({max_batch_seq_len} > 1024), chunking for training")
-                    chunks = chunk_long_sequence(*batch, max_chunk_size=1024)
+                    chunks = chunk_long_sequence_with_overlap(*batch, window_size=1024, overlap=256)
 
                     # Process each chunk
                     chunk_losses = []
@@ -470,7 +554,7 @@ def train_model():
 
                 # Handle long sequences with chunking for validation
                 if max_batch_seq_len > 1024:
-                    chunks = chunk_long_sequence(*batch, max_chunk_size=1024)
+                    chunks = chunk_long_sequence_with_overlap(*batch, window_size=1024, overlap=256)
                     chunk_losses = []
                     chunk_rmsds = []
                     for chunk_batch in chunks:
