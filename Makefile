@@ -30,6 +30,9 @@ preprocess-rna:
 # Train the model
 train:
 	@python3 -m src.model.train
+# Train the model
+train-model-1:
+	@python3 -m src.model.model1.train
 
 # Make predictions on the test data
 predict:
