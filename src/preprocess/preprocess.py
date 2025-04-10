@@ -337,7 +337,7 @@ def process_bppms_in_batches(bppms, max_len, batch_size=10, temp_file=None):
         bppms: List of BPPM matrices
         max_len: Maximum sequence length for padding
         batch_size: Size of batches to process at once
-        temp_file: Optional temporary file path for HDF5 storage
+        temp_file: Optional file path for HDF5 storage
 
     Returns:
         Path to HDF5 file containing padded BPPMs or the padded array for small datasets
@@ -345,14 +345,14 @@ def process_bppms_in_batches(bppms, max_len, batch_size=10, temp_file=None):
     num_samples = len(bppms)
     num_batches = (num_samples + batch_size - 1) // batch_size
 
-    # Generate a temporary filename if not provided
+    # Generate a permanent filename in the data directory if not provided
     if temp_file is None:
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-        temp_file = os.path.join(temp_dir, f"temp_bppms_{int(time.time())}.h5")
+        # Create directory if it doesn't exist
+        os.makedirs("data/processed/bppms", exist_ok=True)
+        temp_file = os.path.join("data/processed/bppms", f"bppms_{int(time.time())}.h5")
 
     log_message(f"Processing {num_samples} BPPMs in {num_batches} batches")
-    log_message(f"Using temp file: {temp_file} to avoid memory issues")
+    log_message(f"Using file: {temp_file} to store BPPM matrices")
 
     # Use HDF5 to store the padded BPPMs without loading everything into memory
     with h5py.File(temp_file, 'w') as h5f:
@@ -406,9 +406,9 @@ def load_bppms_from_h5(h5_file, indices=None, batch_size=4, use_cpu=False, outpu
     """
     # Generate output filename if not provided
     if output_file is None:
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-        output_file = os.path.join(temp_dir, f"processed_bppms_{int(time.time())}.h5")
+        # Create directory if it doesn't exist
+        os.makedirs("data/processed/bppms", exist_ok=True)
+        output_file = os.path.join("data/processed/bppms", f"processed_bppms_{int(time.time())}.h5")
 
     log_message(f"Loading BPPMs from {h5_file} with batch_size={batch_size} and saving to {output_file}")
 
@@ -620,13 +620,8 @@ if __name__ == "__main__":
     bppms_train_file = load_bppms_from_h5(bppms_train_h5, batch_size=4, use_cpu=True)
     bppms_valid_file = load_bppms_from_h5(bppms_valid_h5, batch_size=4, use_cpu=True)
 
-    # Clean up temporary HDF5 files
-    log_message("Cleaning up temporary HDF5 files")
-    try:
-        os.remove(bppms_train_h5)
-        os.remove(bppms_valid_h5)
-    except Exception as e:
-        log_message(f"Warning: Could not remove temporary files: {e}")
+    # Keep the intermediate HDF5 files for reference
+    log_message("Keeping intermediate HDF5 files for training")
 
     # 🔹 Save processed data to HDF5 format
     log_message("Saving processed data to HDF5 format")
