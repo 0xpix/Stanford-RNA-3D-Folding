@@ -6,8 +6,10 @@ __pycache__/
 .env
 .vscode/
 .idea/
+checkpoints/
 notebooks/.ipynb_checkpoints/
 
 data/
+results/
 models/*
 setup.py
