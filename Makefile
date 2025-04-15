@@ -25,7 +25,7 @@ download:
 
 # Preprocess the data
 gen_msa:
-	@python -m src.data.gen_msa
+	@python -m src.data.generate_msa_with_homologs
 
 preprocess-rna:
 	@python -m src.preprocess.preprocess
