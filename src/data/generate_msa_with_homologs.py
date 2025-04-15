@@ -46,13 +46,15 @@ import os
 import io
 import time
 import subprocess
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+
 from Bio import SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
-import numpy as np
 
 # === CONFIGURATION ===
 INPUT_CSV = "data/raw/train_sequences.csv"
