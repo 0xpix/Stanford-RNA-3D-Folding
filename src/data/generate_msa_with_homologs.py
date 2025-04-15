@@ -1,30 +1,73 @@
+"""
+Step 1: Read the csv file and get the target_id, sequence, and all_sequences columns.
+    This is the input phase.
+        You're reading your main dataset that contains:
+        Unique RNA targets (target_id)
+        The primary RNA sequence to align (sequence)
+        Optional known homologs (all_sequences) — some of which may be RNA or protein.
+    This sets the stage for all further processing — everything works per target_id.
+
+Step 2: Builds a collection of sequences for each target to align.
+    For each RNA target:
+        Start with the main sequence from sequence.
+        Parse all_sequences into individual entries.
+        Keep only those that contain valid RNA characters (A, C, G, U).
+        Discard proteins or malformed sequences that contain things like M, K, Q, etc.
+    This gives you a clean group of RNA sequences ready to align.
+
+Step 3: For each target, run BLAST to find homologous sequences.
+    You send your target RNA to BLAST (using blastn remotely):
+        BLAST returns similar sequences from other organisms.
+        Some of these are RNA, others might be noise or protein.
+        You apply the same RNA-only filter to keep only usable homologs.
+    Result: You get evolutionary information for your RNA — more sequences = better alignment.
+
+Step 4: Write the sequences to a temporary FASTA file.
+    This temporary file is the input for alignment. It contains:
+        The original target sequence
+        Any good sequences from all_sequences
+        Any good homologs from BLAST
+    This is the unified set of sequences you want to align.
+
+Step 5: Calculate Features from the MSA
+    You align all sequences using Clustal Omega to produce an MSA (.aln file).
+        From the aligned result, you compute:
+        Conservation: How similar each column (position) is across sequences
+        Nucleotide frequency: Percent of A, C, G, U at each position
+        Gap frequency: How often a gap (-) appears in each column
+        Neff: Number of sequences in the MSA
+    These features capture the evolutionary and structural context of the RNA.
+
+Step 6: Save the features to a .npz file.
+    Result: .npz file will be used later by machine learning model, structure predictor, or analysis script.
+"""
+
 import os
 import io
 import time
 import subprocess
-from tqdm import tqdm
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-
+import pandas as pd
+from tqdm import tqdm
 from Bio import SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
+import numpy as np
 
 # === CONFIGURATION ===
 INPUT_CSV = "data/raw/train_sequences.csv"
-MSA_OUTPUT_DIR = Path("data/raw/msa")
-BLAST_CACHE_DIR = Path("data/raw/blast_cache")
+MSA_OUTPUT_DIR = Path("data/processed/msa")
+BLAST_CACHE_DIR = Path("data/processed/blast_cache")
 MAX_HOMOLOGS = 30
 INCLUDE_ALL_SEQUENCES = True
 MAX_THREADS = 8
-NCBI_DELAY = 1.5
+NCBI_DELAY = 1.5  # polite delay between BLAST calls
 
+# === MAKE DIRECTORIES ===
 MSA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BLAST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# === LOAD DATA ===
+# === LOAD CSV ===
 df = pd.read_csv(INPUT_CSV)
 targets = df[["target_id", "sequence", "all_sequences"]].drop_duplicates()
 
@@ -57,7 +100,11 @@ def extract_homologs(xml_data):
         blast_record = NCBIXML.read(io.StringIO(xml_data))
         for alignment in blast_record.alignments:
             for hsp in alignment.hsps:
-                homologs.append((alignment.hit_id, hsp.sbjct))
+                seq = hsp.sbjct.replace("-", "").replace(" ", "").upper()
+                if all(c in "ACGU" for c in seq):
+                    homologs.append((alignment.hit_id, seq))
+                else:
+                    print(f"[!] Skipped non-RNA homolog: {alignment.hit_id}")
                 if len(homologs) >= MAX_HOMOLOGS:
                     return homologs
     except Exception as e:
@@ -74,9 +121,11 @@ def parse_all_sequences_block(all_sequences_str):
         if len(lines) < 2:
             continue
         header = lines[0].strip()
-        seq = "".join(lines[1:]).strip().replace(" ", "").replace("-", "")
-        if seq:
+        seq = "".join(lines[1:]).strip().replace(" ", "").replace("-", "").upper()
+        if all(c in "ACGU" for c in seq) and len(seq) >= 8:
             sequences.append((header, seq))
+        else:
+            print(f"[!] Skipped non-RNA or invalid sequence: {header}")
     return sequences
 
 
@@ -124,7 +173,7 @@ def process_target(row):
     feature_out = MSA_OUTPUT_DIR / f"{target_id}_features.npz"
 
     if msa_out.exists() and feature_out.exists():
-        return  # Already processed
+        return  # Already done
 
     temp_fasta = MSA_OUTPUT_DIR / f"{target_id}_temp.fasta"
     write_fasta(sequence, f"{target_id}_query", temp_fasta)
@@ -140,8 +189,7 @@ def process_target(row):
         homologs = extract_homologs(xml_data)
         with open(temp_fasta, "a") as f:
             for i, (hit_id, hseq) in enumerate(homologs):
-                seq_clean = hseq.replace("-", "").replace(" ", "").upper()
-                f.write(f">homolog_{i}\n{seq_clean}\n")
+                f.write(f">homolog_{i}\n{hseq}\n")
 
     # Align with Clustal Omega
     cmd = [
@@ -169,7 +217,7 @@ def process_target(row):
     time.sleep(NCBI_DELAY)
 
 
-# === RUN IN PARALLEL ===
+# === RUN PARALLEL EXECUTION ===
 print(f"🚀 Starting with {MAX_THREADS} threads...")
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
     list(
