@@ -24,6 +24,9 @@ download:
 	@python -m src.data.download
 
 # Preprocess the data
+gen_msa:
+	@python -m src.data.gen_msa
+
 preprocess-rna:
 	@python -m src.preprocess.preprocess
 
