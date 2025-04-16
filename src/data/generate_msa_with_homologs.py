@@ -80,20 +80,32 @@ def write_fasta(seq, name, path, mode="w"):
         f.write(f">{name}\n{seq}\n")
 
 
-def run_blast(seq, target_id):
+def run_blast(seq, target_id, max_retries=3, delay=10):
     xml_path = BLAST_CACHE_DIR / f"{target_id}.xml"
     if xml_path.exists():
         with open(xml_path) as f:
             return f.read()
-    try:
-        result_handle = NCBIWWW.qblast("blastn", "nt", seq, hitlist_size=MAX_HOMOLOGS)
-        result = result_handle.read()
-        with open(xml_path, "w") as f:
-            f.write(result)
-        return result
-    except Exception as e:
-        print(f"[!] BLAST failed for {target_id}: {e}")
-        return None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[BLAST] Querying {target_id} (Attempt {attempt})...")
+            result_handle = NCBIWWW.qblast(
+                "blastn", "nt", seq, hitlist_size=MAX_HOMOLOGS
+            )
+            result = result_handle.read()
+            with open(xml_path, "w") as f:
+                f.write(result)
+            return result
+        except Exception as e:
+            print(f"[!] BLAST failed for {target_id} (Attempt {attempt}): {e}")
+            if attempt < max_retries:
+                print(f"    ⏳ Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(
+                    f"[✗] BLAST permanently failed for {target_id} after {max_retries} attempts."
+                )
+                return None
 
 
 def extract_homologs(xml_data):
