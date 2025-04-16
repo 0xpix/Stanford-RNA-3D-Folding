@@ -24,8 +24,11 @@ download:
 	@python -m src.data.download
 
 # Preprocess the data
-gen_msa:
-	@python -m src.data.generate_msa_with_homologs
+gen_msa-train:
+	@python -m src.data.generate_msa_with_homologs --mode training --input data/raw/train_sequences.csv --target-min-sequences 6 --min-sequences-for-msa 3
+
+gen_msa-inference:
+	@python -m src.data.generate_msa_with_homologs --mode inference --input data/raw/test_sequences.csv
 
 preprocess-rna:
 	@python -m src.preprocess.preprocess
