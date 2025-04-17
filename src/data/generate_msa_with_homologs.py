@@ -53,7 +53,7 @@ MIN_SEQUENCES_BEFORE_BLAST = 5  # Minimum sequences before skipping BLAST
 MAX_HOMOLOGS = 30
 MAX_HOMOLOGS_RELAXED = 50  # Increased homolog count for BLAST retry
 MAX_HOMOLOGS_VERY_RELAXED = 100  # Even more homologs for desperate cases
-MAX_THREADS = 8
+MAX_THREADS = 2
 NCBI_DELAY = 1.5
 
 # Minimum sequence threshold to trigger raw fallback vs. very relaxed BLAST
@@ -464,7 +464,7 @@ class MSAGenerator:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=300,  # 5-minute timeout
+                # timeout=300,  # 5-minute timeout
             )
 
             if result.returncode != 0:
@@ -786,10 +786,14 @@ class MSAGenerator:
                 self.stats["raw_features_fallback"] += 1
                 result["used_raw_fallback"] = True
 
+                # 💡 Write the "MSA" file with just the single sequence
+                with open(msa_out, "w") as f:
+                    f.write(f">{target_id}_query\n{sequence}\n")
+                logger.info(f"Wrote single-sequence alignment file to {msa_out}")
+
                 # Generate raw sequence features
                 features = self.generate_raw_sequence_features(sequence)
 
-                # Save features to NPZ file
                 if self.save_features_to_npz(features, feature_out):
                     result["status"] = "success_raw_fallback"
                     self.stats["success"] += 1
@@ -798,10 +802,6 @@ class MSAGenerator:
                     )
                 else:
                     result["status"] = "raw_feature_generation_failed"
-
-                # We don't need the MSA output file for raw sequence fallback
-                if msa_out.exists():
-                    os.remove(msa_out)
 
                 return result
 
