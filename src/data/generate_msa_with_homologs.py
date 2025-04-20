@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Set
+from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
 import pandas as pd
