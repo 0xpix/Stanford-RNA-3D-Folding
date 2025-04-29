@@ -61,7 +61,7 @@ train:
 	@python3 -m src.model.train
 # Train the model
 train-model-1:
-	@python3 -m src.model.model1.train
+	@python -m src.model.model1.train --batch_size 8 --epochs 2 --lr 1e-4 --model_dim 8 --num_heads 1 --depth 1 --output_dir checkpoints/rna_model1
 
 # Make predictions on the test data
 predict:
