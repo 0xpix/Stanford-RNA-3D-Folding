@@ -33,6 +33,26 @@ gen_msa-valid:
 gen_msa-inference:
 	@python -m src.data.generate_msa_with_homologs --mode inference --input data/raw/test_sequences.csv
 
+bppms:
+	@python -m src.extract_and_generate_bppms --use_raw_fallback
+
+bppms-full:
+	@python -m src.extract_and_generate_bppms --use_raw_fallback --msa_dir data/processed/MSA
+
+bppms-all:
+	@python -m src.extract_all_sequences_and_generate_bppms --msa_dir data/processed/MSA
+
+bppms-all-limit:
+	@python -m src.extract_all_sequences_and_generate_bppms --msa_dir data/processed/msa --limit 10
+
+# Generate and pad BPPMs from MSA files
+bppms-padded:
+	@python -m src.generate_and_pad_bppms_from_msa
+
+# Generate and pad BPPMs with custom max length
+bppms-padded-custom:
+	@python -m src.generate_and_pad_bppms_from_msa --max_len 2048 --min_pad 1024
+
 preprocess-rna:
 	@python -m src.preprocess.preprocess
 
