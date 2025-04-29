@@ -46,271 +46,353 @@ def process_labels(labels_df):
     labels_df["resid"] = ids_split[1].astype(int)  # Convert residue number to int
 
     # 🔹 Convert coordinates to NumPy array for batch processing
-    coords = labels_df[["x_1", "y_1", "z_1"]].to_numpy(dtype=jnp.float32)
+    coords = labels_df[["x_1", "y_1", "z_1"]].to_numpy(dtype=np.float32)
 
     # 🔹 Group by `target_id` and stack residues
     label_dict = {}
     for target_id, group in labels_df.groupby("target_id"):
         # Sort by `resid` and stack the coordinates
-        sorted_indices = jnp.argsort(group["resid"].to_numpy())
+        sorted_indices = np.argsort(group["resid"].to_numpy())
         sorted_coords = coords[group.index[sorted_indices]]  # Faster indexing
 
-        # Convert to JAX array and store
-        label_dict[target_id] = jnp.array(sorted_coords, dtype=jnp.float32)
+        # Keep as numpy initially to save memory
+        label_dict[target_id] = sorted_coords
 
     return label_dict
 
 
-def create_dataset(sequences_df, labels_dict):
+def pad_sequences(sequences, max_len):
     """
-    Creates a dataset: X (encoded RNA sequences), y (3D coordinates), target_ids.
+    Pads sequences using NumPy operations.
     """
-    X, y, target_ids = [], [], []
-
-    for _, row in sequences_df.iterrows():
-        tid = row["target_id"]
-        if tid in labels_dict:
-            X.append(encode_sequence(row["sequence"]))
-            y.append(labels_dict[tid])
-            target_ids.append(tid)
-
-    return X, y, target_ids
-
-
-def pad_sequences_jax(sequences, max_len):
-    """
-    Pads sequences using JAX operations.
-    """
-    padded_sequences = jnp.zeros((len(sequences), max_len), dtype=jnp.int32)
+    padded_sequences = np.zeros((len(sequences), max_len), dtype=np.int32)
 
     for i, seq in enumerate(sequences):
-        padded_sequences = padded_sequences.at[i, : len(seq)].set(seq)
+        seq_len = len(seq)
+        padded_sequences[i, :seq_len] = seq
 
     return padded_sequences
 
 
-def pad_coordinates_jax(coord_array, max_len):
+def pad_coordinates(coord_array, max_len):
     """
-    Pads coordinate arrays to the max sequence length using JAX.
+    Pads coordinate arrays to the max sequence length using NumPy.
     """
     L = coord_array.shape[0]
     if L < max_len:
         pad_width = ((0, max_len - L), (0, 0))  # Only pad along first axis
-        return jnp.pad(coord_array, pad_width, mode="constant", constant_values=0)
-    return coord_array
+        return np.pad(coord_array, pad_width, mode="constant", constant_values=0)
+    return coord_array[:max_len]
 
 
-def load_msa_data(target_id, msa_dir="data/raw/msa"):
+def load_msa_from_npz(target_id, msa_dir="data/processed/msa"):
     """
-    Loads MSA data for a given target ID.
+    Load MSA conservation data from a pre-generated NPZ file.
 
     Args:
         target_id: The RNA target identifier
-        msa_dir: Directory containing MSA files
+        msa_dir: Directory containing MSA NPZ files
 
     Returns:
-        Dictionary with MSA features including conservation scores
+        Conservation scores as NumPy array or None if file not found
     """
-    msa_file = os.path.join(msa_dir, f"{target_id}.a2m")
+    msa_file = os.path.join(msa_dir, f"{target_id}_features.npz")
 
-    # Check if MSA file exists
     if not os.path.exists(msa_file):
-        # Return empty features if no MSA data
         return None
 
-    # Load MSA file - typically in A2M or FASTA format
-    with open(msa_file, 'r') as f:
-        msa_lines = f.readlines()
-
-    # Parse MSA data (simplified version)
-    sequences = []
-    current_seq = ""
-
-    for line in msa_lines:
-        line = line.strip()
-        if line.startswith('>'):
-            if current_seq:
-                sequences.append(current_seq)
-                current_seq = ""
-        else:
-            current_seq += line
-
-    if current_seq:
-        sequences.append(current_seq)
-
-    if not sequences:
+    try:
+        with np.load(msa_file, allow_pickle=True) as data:
+            # Check if conservation data exists
+            if "conservation" in data:
+                conservation = np.array(data["conservation"], dtype=np.float32)
+                return conservation
+            else:
+                log_message(f"Warning: No conservation data in {msa_file}")
+                return None
+    except Exception as e:
+        log_message(f"Error loading MSA data for {target_id}: {str(e)}")
         return None
 
-    # Calculate conservation scores using JAX vectorization
-    seq_len = len(sequences[0])
 
-    # Convert sequences to a matrix for vectorized operations
-    seq_matrix = np.zeros((len(sequences), seq_len), dtype=np.int32)
-    for i, seq in enumerate(sequences):
-        for j, nt in enumerate(seq[:seq_len]):
-            if nt.upper() == 'A':
-                seq_matrix[i, j] = 1
-            elif nt.upper() == 'C':
-                seq_matrix[i, j] = 2
-            elif nt.upper() == 'G':
-                seq_matrix[i, j] = 3
-            elif nt.upper() == 'U':
-                seq_matrix[i, j] = 4
-            # All other characters (gaps, etc.) are 0
+def load_bppm_from_npz(target_id, bppm_dir="data/processed/bppms_padded"):
+    """
+    Load BPPM data from a pre-generated NPZ file.
 
-    # JAX-friendly conservation calculation
-    seq_matrix_jax = jnp.array(seq_matrix)
+    Args:
+        target_id: The RNA target identifier
+        bppm_dir: Directory containing BPPM NPZ files
 
-    def get_conservation(pos_data):
-        # Count occurrences of each nucleotide
-        counts = jnp.bincount(pos_data, length=5)  # 0-4 for gap, A, C, G, U
-        total = jnp.sum(counts)
-        # Avoid division by zero
-        return jnp.where(total > 0, jnp.max(counts) / total, 0.0)
+    Returns:
+        BPPM matrix as NumPy array or None if file not found
+    """
+    bppm_file = os.path.join(bppm_dir, f"{target_id}_bppm.npz")
 
-    # Apply conservation calculation to each position using vmap with jit
-    get_conservation_batched = jit(vmap(get_conservation))
-    conservation = get_conservation_batched(seq_matrix_jax.T)
+    if not os.path.exists(bppm_file):
+        return None
+
+    try:
+        with np.load(bppm_file, allow_pickle=True) as data:
+            # Check if BPPM data exists
+            if "bppm" in data:
+                # Keep as NumPy array to avoid GPU memory problems
+                bppm = np.array(data["bppm"], dtype=np.float32)
+                return bppm
+            else:
+                log_message(f"Warning: No BPPM data in {bppm_file}")
+                return None
+    except Exception as e:
+        log_message(f"Error loading BPPM data for {target_id}: {str(e)}")
+        return None
+
+
+def process_single_sample(row, labels_dict, msa_dir, bppm_dir, max_len):
+    """
+    Process a single RNA sample and return all features as padded NumPy arrays.
+
+    Args:
+        row: DataFrame row containing target_id and sequence
+        labels_dict: Dictionary mapping target_id to 3D coordinates
+        msa_dir: Directory for MSA features
+        bppm_dir: Directory for BPPM features
+        max_len: Maximum length for padding
+
+    Returns:
+        Dictionary with processed features or None if sample should be skipped
+    """
+    tid = row["target_id"]
+    seq = row["sequence"]
+
+    # Skip if no 3D coordinates
+    if tid not in labels_dict:
+        return None, "Missing 3D coordinates"
+
+    # Load MSA conservation data
+    conservation = load_msa_from_npz(tid, msa_dir)
+    if conservation is None:
+        return None, "Missing MSA conservation data"
+
+    # Load BPPM data
+    bppm = load_bppm_from_npz(tid, bppm_dir)
+    if bppm is None:
+        return None, "Missing BPPM data"
+
+    # If we made it here, we have all the required data
+    # Encode and pad sequence
+    encoded_seq = np.array([nucleotide_map.get(ch, 0) for ch in seq], dtype=np.int32)
+    padded_seq = np.zeros(max_len, dtype=np.int32)
+    padded_seq[: len(encoded_seq)] = encoded_seq
+
+    # Pad MSA conservation
+    padded_conservation = np.zeros(max_len, dtype=np.float32)
+    padded_conservation[: min(len(conservation), max_len)] = conservation[
+        : min(len(conservation), max_len)
+    ]
+
+    # Pad BPPM
+    padded_bppm = pad_bppm(bppm, max_len)
+
+    # Pad coordinates
+    coords = labels_dict[tid]
+    padded_coords = pad_coordinates(coords, max_len)
+
+    # Return processed sample
+    return {
+        "X": padded_seq,
+        "msa_conservation": padded_conservation,
+        "bppm": padded_bppm,
+        "y": padded_coords,
+        "target_id": tid,
+    }, None
+
+
+def incremental_processing(
+    sequences_df,
+    labels_dict,
+    max_len,
+    msa_dir="data/processed/msa",
+    bppm_dir="data/processed/bppms_padded",
+    output_file="data/processed/processed_data_final.h5",
+    batch_size=10,
+    mode="train",
+):
+    """
+    Process RNA samples incrementally, saving batches to disk to minimize memory usage.
+    Uses HDF5 as the final output format.
+
+    Args:
+        sequences_df: DataFrame with target_id and sequence
+        labels_dict: Dictionary mapping target_id to 3D coordinates
+        max_len: Maximum sequence length for padding
+        msa_dir: Directory containing MSA files
+        bppm_dir: Directory containing BPPM files
+        output_file: Path to save the processed data (HDF5 format)
+        batch_size: Number of samples to process before saving
+        mode: 'train' or 'valid'
+
+    Returns:
+        Dictionary with dataset metadata
+    """
+    log_message(
+        f"Starting incremental processing for {mode} data ({len(sequences_df)} samples)"
+    )
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+    # Create HDF5 file for saving data incrementally (this is now the final output)
+    h5_file = output_file
+    with h5py.File(h5_file, "w") as h5f:
+        # Create datasets with extendable dimensions
+        x_dset = h5f.create_dataset(
+            "X",
+            shape=(0, max_len),
+            maxshape=(None, max_len),
+            dtype=np.int32,
+            chunks=(batch_size, max_len),
+            compression="gzip",
+            compression_opts=4,
+        )
+        msa_dset = h5f.create_dataset(
+            "msa_conservation",
+            shape=(0, max_len),
+            maxshape=(None, max_len),
+            dtype=np.float32,
+            chunks=(batch_size, max_len),
+            compression="gzip",
+            compression_opts=4,
+        )
+        bppm_dset = h5f.create_dataset(
+            "bppm",
+            shape=(0, max_len, max_len),
+            maxshape=(None, max_len, max_len),
+            dtype=np.float32,
+            chunks=(1, max_len, max_len),
+            compression="gzip",
+            compression_opts=1,  # Use lower compression for the large BPPMs for better speed
+        )
+        y_dset = h5f.create_dataset(
+            "y",
+            shape=(0, max_len, 3),
+            maxshape=(None, max_len, 3),
+            dtype=np.float32,
+            chunks=(batch_size, max_len, 3),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+        # Create a list to store target IDs
+        target_ids = []
+        skipped_targets = []
+
+        # Process in batches
+        batch_x = []
+        batch_msa = []
+        batch_bppm = []
+        batch_y = []
+
+        total_processed = 0
+
+        # Process each sample
+        for idx, row in tqdm(
+            sequences_df.iterrows(),
+            total=len(sequences_df),
+            desc=f"Processing {mode} samples",
+        ):
+            # Process the sample
+            sample, skip_reason = process_single_sample(
+                row, labels_dict, msa_dir, bppm_dir, max_len
+            )
+
+            if sample is None:
+                skipped_targets.append((row["target_id"], skip_reason))
+                continue
+
+            # Add to batch
+            batch_x.append(sample["X"])
+            batch_msa.append(sample["msa_conservation"])
+            batch_bppm.append(sample["bppm"])
+            batch_y.append(sample["y"])
+            target_ids.append(sample["target_id"])
+
+            # Save batch when it reaches batch_size
+            if len(batch_x) >= batch_size:
+                # Resize datasets
+                current_size = x_dset.shape[0]
+                new_size = current_size + len(batch_x)
+
+                x_dset.resize(new_size, axis=0)
+                msa_dset.resize(new_size, axis=0)
+                bppm_dset.resize(new_size, axis=0)
+                y_dset.resize(new_size, axis=0)
+
+                # Write data
+                x_dset[current_size:new_size] = np.array(batch_x)
+                msa_dset[current_size:new_size] = np.array(batch_msa)
+                bppm_dset[current_size:new_size] = np.array(batch_bppm)
+                y_dset[current_size:new_size] = np.array(batch_y)
+
+                # Update counter and clear batch
+                total_processed += len(batch_x)
+
+                batch_x = []
+                batch_msa = []
+                batch_bppm = []
+                batch_y = []
+
+                # Force garbage collection
+                gc.collect()
+
+        # Save any remaining samples
+        if len(batch_x) > 0:
+            current_size = x_dset.shape[0]
+            new_size = current_size + len(batch_x)
+
+            x_dset.resize(new_size, axis=0)
+            msa_dset.resize(new_size, axis=0)
+            bppm_dset.resize(new_size, axis=0)
+            y_dset.resize(new_size, axis=0)
+
+            x_dset[current_size:new_size] = np.array(batch_x)
+            msa_dset[current_size:new_size] = np.array(batch_msa)
+            bppm_dset[current_size:new_size] = np.array(batch_bppm)
+            y_dset[current_size:new_size] = np.array(batch_y)
+
+            total_processed += len(batch_x)
+
+        # Save metadata as attributes
+        h5f.attrs["max_len"] = max_len
+        h5f.attrs["num_samples"] = total_processed
+        h5f.attrs["date_created"] = str(pd.Timestamp.now())
+
+        # Create a dataset for target IDs
+        tid_dt = h5py.special_dtype(vlen=str)
+        tid_dset = h5f.create_dataset(
+            "target_ids", shape=(len(target_ids),), dtype=tid_dt
+        )
+        for i, tid in enumerate(target_ids):
+            tid_dset[i] = tid
+
+    log_message(
+        f"Completed incremental processing for {mode}: {total_processed} samples included, {len(skipped_targets)} skipped"
+    )
+    log_message(f"Data saved to HDF5 file: {h5_file}")
+
+    if skipped_targets:
+        log_message(f"First 5 skipped targets (or fewer if less than 5):")
+        for tid, reason in skipped_targets[:5]:
+            log_message(f"  - {tid}: {reason}")
+
+    # No conversion to .npz or .pkl needed - HDF5 is the final format
 
     return {
-        'conservation': jnp.array(conservation, dtype=jnp.float32),
-        'num_sequences': len(sequences)
+        "samples_processed": total_processed,
+        "skipped": len(skipped_targets),
+        "output_file": h5_file,
+        "target_ids": target_ids,
+        "max_len": max_len,
     }
 
-def generate_bppm(sequence):
-    """
-    Generates Base Pair Probability Matrix for an RNA sequence using ViennaRNA.
-
-    Args:
-        sequence: RNA sequence
-
-    Returns:
-        BPPM as a square matrix
-    """
-    if RNA is None:
-        # Return zeros if ViennaRNA is not available
-        seq_len = len(sequence)
-        return jnp.zeros((seq_len, seq_len), dtype=jnp.float32)
-
-    # Create fold compound
-    fc = RNA.fold_compound(sequence)
-
-    # Compute partition function
-    fc.pf()
-
-    # Get base pair probabilities
-    seq_len = len(sequence)
-    bppm = np.zeros((seq_len, seq_len), dtype=np.float32)
-
-    # Access the base pair probability matrix directly
-    probs = fc.bpp()  # Retrieve the probability matrix
-    for i in range(seq_len):
-        for j in range(i + 1, seq_len):
-            prob = probs[i + 1][j + 1]  # Use 1-based indexing
-            bppm[i, j] = prob
-            bppm[j, i] = prob  # Make it symmetric
-
-    return bppm  # Return NumPy array instead of converting to JAX array here
-
-def process_bppm_parallel(sequences, n_jobs=None):
-    """
-    Generates BPPMs for multiple sequences in parallel.
-
-    Args:
-        sequences: List of RNA sequences
-        n_jobs: Number of CPU cores to use, None means all available
-
-    Returns:
-        List of BPPM matrices
-    """
-    if RNA is None:
-        # Return zeros if ViennaRNA is not available
-        return [np.zeros((len(seq), len(seq)), dtype=np.float32) for seq in sequences]
-
-    if n_jobs is None:
-        n_jobs = max(1, multiprocessing.cpu_count() - 1)
-
-    log_message(f"Generating BPPMs using {n_jobs} CPU cores")
-
-    # Use pool.imap for a progress bar
-    with multiprocessing.Pool(processes=n_jobs) as pool:
-        results = list(tqdm(
-            pool.imap(generate_bppm, sequences),
-            total=len(sequences),
-            desc="Generating BPPMs"
-        ))
-
-    return results
-
-def process_sequences_with_features(sequences_df, labels_dict, msa_dir="data/raw/msa", n_jobs=None):
-    """
-    Creates a dataset with additional features: X (encoded RNA sequences),
-    MSA conservation, BPPMs, y (3D coordinates), target_ids.
-    """
-    X, msas, y, target_ids, sequences = [], [], [], [], []
-
-    log_message("Preprocessing sequences and MSA data")
-    for _, row in tqdm(sequences_df.iterrows(), total=len(sequences_df), desc="Processing sequences"):
-        tid = row["target_id"]
-        seq = row["sequence"]
-
-        if tid in labels_dict:
-            # Basic sequence encoding
-            X.append(encode_sequence(seq))
-
-            # Store sequence for later BPPM batch processing
-            sequences.append(seq)
-
-            # MSA features
-            msa_features = load_msa_data(tid, msa_dir)
-            if msa_features is None:
-                # If no MSA data, use zeros
-                msa_features = {
-                    'conservation': jnp.zeros(len(seq), dtype=jnp.float32),
-                    'num_sequences': 0
-                }
-            msas.append(msa_features)
-
-            # Labels
-            y.append(labels_dict[tid])
-            target_ids.append(tid)
-
-    # Generate BPPMs in parallel
-    log_message("Starting parallel BPPM generation")
-    start_time = time.time()
-    bppms = process_bppm_parallel(sequences, n_jobs=n_jobs)
-    elapsed = time.time() - start_time
-    log_message(f"BPPM generation completed in {elapsed:.2f} seconds")
-
-    return X, msas, bppms, y, target_ids
-
-def pad_msa_features(msa_list, max_len):
-    """
-    Pads MSA conservation features to the max sequence length.
-    """
-    padded_features = []
-
-    for msa in msa_list:
-        conservation = msa['conservation']
-        L = conservation.shape[0]
-
-        if L < max_len:
-            # Pad the conservation scores
-            padded_conservation = jnp.pad(
-                conservation,
-                (0, max_len - L),
-                mode="constant",
-                constant_values=0
-            )
-        else:
-            padded_conservation = conservation[:max_len]
-
-        padded_features.append({
-            'conservation': padded_conservation,
-            'num_sequences': msa['num_sequences']
-        })
-
-    return padded_features
 
 def pad_bppm(bppm, max_len):
     """
@@ -323,231 +405,119 @@ def pad_bppm(bppm, max_len):
             bppm,
             ((0, max_len - L), (0, max_len - L)),
             mode="constant",
-            constant_values=0
+            constant_values=0,
         )
         return padded_bppm
     return bppm[:max_len, :max_len]
 
-def process_bppms_in_batches(bppms, max_len, batch_size=10, temp_file=None):
+
+def load_data_from_h5(h5_file, use_jax=True, batch_size=8):
     """
-    Process and pad BPPMs in smaller batches to reduce memory usage.
-    Uses HDF5 file-based storage to avoid large memory allocations.
+    Load RNA data from HDF5 file for model training.
 
     Args:
-        bppms: List of BPPM matrices
-        max_len: Maximum sequence length for padding
-        batch_size: Size of batches to process at once
-        temp_file: Optional file path for HDF5 storage
+        h5_file: Path to HDF5 file containing processed data
+        use_jax: If True, convert arrays to JAX arrays; otherwise, keep as NumPy
+        batch_size: Number of samples to load at once to manage memory
 
     Returns:
-        Path to HDF5 file containing padded BPPMs or the padded array for small datasets
+        Dictionary containing the data ready for model training
     """
-    num_samples = len(bppms)
-    num_batches = (num_samples + batch_size - 1) // batch_size
+    log_message(f"Loading data from {h5_file}")
 
-    # Generate a permanent filename in the data directory if not provided
-    if temp_file is None:
-        # Create directory if it doesn't exist
-        os.makedirs("data/processed/bppms", exist_ok=True)
-        temp_file = os.path.join("data/processed/bppms", f"bppms_{int(time.time())}.h5")
+    if not os.path.exists(h5_file):
+        raise FileNotFoundError(f"HDF5 file not found: {h5_file}")
 
-    log_message(f"Processing {num_samples} BPPMs in {num_batches} batches")
-    log_message(f"Using file: {temp_file} to store BPPM matrices")
+    with h5py.File(h5_file, "r") as h5f:
+        # Get metadata
+        max_len = int(h5f.attrs["max_len"])
+        num_samples = int(h5f.attrs["num_samples"])
 
-    # Use HDF5 to store the padded BPPMs without loading everything into memory
-    with h5py.File(temp_file, 'w') as h5f:
-        # Create a dataset with the right dimensions
-        dset = h5f.create_dataset(
-            "padded_bppms",
-            shape=(num_samples, max_len, max_len),
-            dtype=np.float32,
-            chunks=(1, min(1024, max_len), min(1024, max_len)),  # Optimize chunk size
-            compression="gzip",
-            compression_opts=1  # Use minimal compression to speed up the process
-        )
+        # Load target IDs
+        target_ids = [
+            tid.decode("utf-8") if isinstance(tid, bytes) else str(tid)
+            for tid in h5f["target_ids"][:]
+        ]
 
-        # Use tqdm for progress tracking
-        for i in tqdm(range(num_batches), desc="Padding BPPMs"):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
+        # Load data in batches to manage memory
+        if use_jax:
+            # For JAX arrays
+            X = jnp.zeros((num_samples, max_len), dtype=jnp.int32)
+            msa_conservation = jnp.zeros((num_samples, max_len), dtype=jnp.float32)
+            bppm = jnp.zeros((num_samples, max_len, max_len), dtype=jnp.float32)
+            y = jnp.zeros((num_samples, max_len, 3), dtype=jnp.float32)
 
-            log_message(f"Processing BPPM batch {i+1}/{num_batches} (samples {start_idx} to {end_idx-1})")
+            for i in range(0, num_samples, batch_size):
+                end_idx = min(i + batch_size, num_samples)
 
-            # Process and write each BPPM individually
-            for j in range(start_idx, end_idx):
-                padded = pad_bppm(bppms[j], max_len)
-                dset[j] = padded
+                # Load batch as numpy first
+                X_batch = np.array(h5f["X"][i:end_idx])
+                msa_batch = np.array(h5f["msa_conservation"][i:end_idx])
+                bppm_batch = np.array(h5f["bppm"][i:end_idx])
+                y_batch = np.array(h5f["y"][i:end_idx])
 
-                # Free memory immediately
-                del padded
+                # Convert to JAX and assign
+                X = X.at[i:end_idx].set(jnp.array(X_batch))
+                msa_conservation = msa_conservation.at[i:end_idx].set(
+                    jnp.array(msa_batch)
+                )
+                bppm = bppm.at[i:end_idx].set(jnp.array(bppm_batch))
+                y = y.at[i:end_idx].set(jnp.array(y_batch))
 
-            # Force garbage collection every few batches
-            if i % 5 == 0:
-                import gc
-                gc.collect()
-
-    log_message(f"Completed padding all BPPMs to HDF5 file: {temp_file}")
-    return temp_file
-
-def load_bppms_from_h5(h5_file, indices=None, batch_size=4, use_cpu=False, output_file=None):
-    """
-    Load BPPMs from HDF5 file in batches, process them, and immediately save to a new HDF5 file.
-    Avoids accumulating all data in memory.
-
-    Args:
-        h5_file: Path to HDF5 file with BPPMs
-        indices: Optional list of indices to load (None loads all)
-        batch_size: Number of matrices to load and process at once
-        use_cpu: If True, process on CPU to reduce memory usage
-        output_file: Path to save processed BPPMs (auto-generated if None)
-
-    Returns:
-        Path to the HDF5 file containing processed BPPM matrices
-    """
-    # Generate output filename if not provided
-    if output_file is None:
-        # Create directory if it doesn't exist
-        os.makedirs("data/processed/bppms", exist_ok=True)
-        output_file = os.path.join("data/processed/bppms", f"processed_bppms_{int(time.time())}.h5")
-
-    log_message(f"Loading BPPMs from {h5_file} with batch_size={batch_size} and saving to {output_file}")
-
-    # Get CPU device for initial processing
-    cpu_device = jax.devices("cpu")[0]
-
-    with h5py.File(h5_file, 'r') as h5f:
-        dset = h5f["padded_bppms"]
-        total_samples = dset.shape[0]
-        sample_shape = dset[0].shape
-
-        if indices is None:
-            indices = list(range(total_samples))
-
-        num_batches = (len(indices) + batch_size - 1) // batch_size
-
-        # Create output file and dataset
-        with h5py.File(output_file, 'w') as out_f:
-            # Create dataset with the same shape and dtype
-            out_dset = out_f.create_dataset(
-                "padded_bppms",
-                shape=(len(indices),) + sample_shape,
-                dtype=dset.dtype,
-                chunks=(min(batch_size, len(indices)),) + sample_shape,
-                compression="gzip",
-                compression_opts=1  # Use minimal compression for speed
-            )
-
-            for i in tqdm(range(num_batches), desc="Processing and saving BPPMs"):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, len(indices))
-                batch_indices = indices[start_idx:end_idx]
-
-                # Load batch data
-                batch_data = np.array([dset[j] for j in batch_indices])
-
-                # Process batch (convert to JAX array if needed)
-                if use_cpu:
-                    # Process on CPU to reduce memory usage
-                    batch_jax = device_put(jnp.array(batch_data), cpu_device)
-                    # Convert back to numpy for saving
-                    processed_batch = np.array(batch_jax)
-                else:
-                    processed_batch = batch_data
-
-                # Save batch directly to output file
-                out_dset[start_idx:end_idx] = processed_batch
-
-                # Clear memory
-                del batch_data
-                del processed_batch
-                if 'batch_jax' in locals():
-                    del batch_jax
-
-                # Force garbage collection every few batches
-                if i % 3 == 0:
+                # Force garbage collection
+                del X_batch, msa_batch, bppm_batch, y_batch
+                if (i // batch_size) % 5 == 0:
                     gc.collect()
+        else:
+            # For NumPy arrays (memory efficient)
+            X = np.array(h5f["X"][:])
+            msa_conservation = np.array(h5f["msa_conservation"][:])
+            bppm = np.array(h5f["bppm"][:])
+            y = np.array(h5f["y"][:])
 
-    log_message(f"Successfully processed and saved all BPPMs to {output_file}")
-    return output_file
+    # Create the data dictionary
+    data = {
+        "X": X,
+        "msa_conservation": msa_conservation,
+        "bppm": bppm,
+        "y": y,
+        "target_ids": target_ids,
+        "max_len": max_len,
+    }
 
-def batch_process_arrays(arrays, process_fn, batch_size=32, description="Processing"):
-    """
-    Generic function to process arrays in batches to manage memory usage.
+    log_message(f"Data loaded successfully: {num_samples} samples")
+    log_message(
+        f"Shapes: X={X.shape}, msa={msa_conservation.shape}, bppm={bppm.shape}, y={y.shape}"
+    )
 
-    Args:
-        arrays: List of arrays to process
-        process_fn: Function that takes an array and returns a processed array
-        batch_size: Number of arrays to process in each batch
-        description: Description for the progress bar
+    return data
 
-    Returns:
-        List of processed arrays
-    """
-    results = []
-    total = len(arrays)
 
-    for i in tqdm(range(0, total, batch_size), desc=description):
-        batch = arrays[i:min(i+batch_size, total)]
-        processed_batch = [process_fn(arr) for arr in batch]
-        results.extend(processed_batch)
+# Add an example usage function
+def example_h5_loading():
+    """Example of how to load data from HDF5 files for training"""
+    # Load training data as JAX arrays
+    train_data = load_data_from_h5(
+        "data/processed/processed_data_final.h5", use_jax=True, batch_size=8
+    )
 
-        # Force garbage collection periodically
-        if i % (batch_size * 5) == 0:
-            import gc
-            gc.collect()
+    # Load validation data as NumPy arrays (more memory efficient)
+    valid_data = load_data_from_h5(
+        "data/processed/processed_data_valid_final.h5", use_jax=False, batch_size=8
+    )
 
-    return results
+    # Access the data
+    X_train = train_data["X"]  # JAX array
+    y_train = train_data["y"]
 
-def save_to_hdf5(filename, data_dict, compression="gzip", compression_opts=4):
-    """
-    Save data to HDF5 format with compression.
-    Handles both direct data arrays and references to HDF5 files.
-    """
-    log_message(f"Saving data to {filename}")
-    with h5py.File(filename, 'w') as f:
-        # Create groups for organization
-        train_group = f.create_group('train')
-        valid_group = f.create_group('valid')
+    X_valid = valid_data["X"]  # NumPy array
+    y_valid = valid_data["y"]
 
-        # Save training data
-        for key, value in tqdm(data_dict['train'].items(), desc="Saving training data"):
-            if key == 'bppms_file':
-                # Store the file path as an attribute
-                train_group.attrs['bppms_file'] = np.string_(value)
-            elif isinstance(value, list) and key == 'msas':
-                # Handle MSA features specially
-                msa_group = train_group.create_group('msas')
-                for i, msa in enumerate(value):
-                    msa_item = msa_group.create_group(f'item_{i}')
-                    msa_item.create_dataset('conservation', data=msa['conservation'],
-                                         compression=compression, compression_opts=compression_opts)
-                    msa_item.attrs['num_sequences'] = msa['num_sequences']
-            else:
-                train_group.create_dataset(key, data=value,
-                                        compression=compression, compression_opts=compression_opts)
+    # Example training loop would go here
+    # ...
 
-        # Save validation data
-        for key, value in tqdm(data_dict['valid'].items(), desc="Saving validation data"):
-            if key == 'bppms_file':
-                # Store the file path as an attribute
-                valid_group.attrs['bppms_file'] = np.string_(value)
-            elif isinstance(value, list) and key == 'msas':
-                # Handle MSA features specially
-                msa_group = valid_group.create_group('msas')
-                for i, msa in enumerate(value):
-                    msa_item = msa_group.create_group(f'item_{i}')
-                    msa_item.create_dataset('conservation', data=msa['conservation'],
-                                         compression=compression, compression_opts=compression_opts)
-                    msa_item.attrs['num_sequences'] = msa['num_sequences']
-            else:
-                valid_group.create_dataset(key, data=value,
-                                        compression=compression, compression_opts=compression_opts)
+    return train_data, valid_data
 
-        # Save metadata
-        f.attrs['max_len'] = data_dict['max_len']
-        f.attrs['creation_date'] = np.string_(time.strftime("%Y-%m-%d %H:%M:%S"))
-
-    log_message(f"Data successfully saved to {filename}")
 
 if __name__ == "__main__":
     log_message("🧬 Data processing started!")
@@ -565,99 +535,82 @@ if __name__ == "__main__":
     train_labels.fillna(0, inplace=True)
     valid_labels.fillna(0, inplace=True)
 
-    # 🔹 Process labels
+    # 🔹 Process labels - use NumPy instead of JAX for memory efficiency
     log_message("Processing labels")
     train_labels_dict = process_labels(train_labels)
     valid_labels_dict = process_labels(valid_labels)
 
-    # 🔹 Create datasets with enhanced features
-    log_message("Creating datasets with MSA and BPPM features")
-    # Use available CPU cores minus one for BPPM generation
-    n_jobs = max(1, multiprocessing.cpu_count() - 1)
-    log_message(f"Using {n_jobs} CPU cores for parallel processing")
+    # 🔹 Estimate maximum sequence length from a sample of sequences
+    # This avoids loading all sequences at once
+    log_message("Estimating maximum sequence length")
 
-    X_train, msas_train, bppms_train, y_train, train_ids = process_sequences_with_features(
-        train_sequences, train_labels_dict, n_jobs=n_jobs
+    # Sample a small number of targets to estimate max length
+    sample_train_rows = train_sequences.sample(min(50, len(train_sequences)))
+    sample_valid_rows = valid_sequences.sample(min(50, len(valid_sequences)))
+
+    # Get a preliminary estimate from sequences
+    seq_lens = [len(row["sequence"]) for _, row in sample_train_rows.iterrows()]
+    seq_lens += [len(row["sequence"]) for _, row in sample_valid_rows.iterrows()]
+
+    # Load a few BPPMs to check their dimensions
+    bppm_sample_size = 10
+    bppm_train_sample = [
+        load_bppm_from_npz(row["target_id"])
+        for _, row in train_sequences.sample(bppm_sample_size).iterrows()
+        if load_bppm_from_npz(row["target_id"]) is not None
+    ]
+
+    bppm_valid_sample = [
+        load_bppm_from_npz(row["target_id"])
+        for _, row in valid_sequences.sample(bppm_sample_size).iterrows()
+        if load_bppm_from_npz(row["target_id"]) is not None
+    ]
+
+    bppm_lens = [
+        b.shape[0] for b in bppm_train_sample + bppm_valid_sample if b is not None
+    ]
+
+    # Use the maximum dimension across sampled data
+    max_len = max(max(seq_lens), max(bppm_lens) if bppm_lens else 0)
+    # Add a small buffer to be safe
+    max_len = int(max_len * 1.05)
+
+    log_message(f"Estimated maximum dimension: {max_len}")
+
+    # 🔹 Process data incrementally and save directly to HDF5 format
+    train_result = incremental_processing(
+        train_sequences,
+        train_labels_dict,
+        max_len,
+        output_file="data/processed/processed_data_final.h5",
+        batch_size=8,
+        mode="train",
     )
-    X_valid, msas_valid, bppms_valid, y_valid, valid_ids = process_sequences_with_features(
-        valid_sequences, valid_labels_dict, n_jobs=n_jobs
+
+    valid_result = incremental_processing(
+        valid_sequences,
+        valid_labels_dict,
+        max_len,
+        output_file="data/processed/processed_data_valid_final.h5",
+        batch_size=8,
+        mode="validation",
     )
 
-    # 🔹 Determine max sequence length
-    max_len = max(max(len(seq) for seq in X_train), max(len(seq) for seq in X_valid))
-    log_message(f"Maximum sequence length: {max_len}")
-
-    # 🔹 Pad sequences using JAX
-    log_message(f"Padding sequences to max length {max_len}")
-    X_train_pad = pad_sequences_jax(X_train, max_len)
-    X_valid_pad = pad_sequences_jax(X_valid, max_len)
-
-    # 🔹 Pad MSA features
-    log_message("Padding MSA features")
-    msas_train_pad = pad_msa_features(msas_train, max_len)
-    msas_valid_pad = pad_msa_features(msas_valid, max_len)
-
-    # 🔹 Pad BPPM features in smaller batches using disk-based storage
-    log_message("Padding BPPM matrices in smaller batches using disk-based storage")
-    # Use smaller batch size to reduce memory usage
-    bppms_train_h5 = process_bppms_in_batches(bppms_train, max_len, batch_size=16)
-    bppms_valid_h5 = process_bppms_in_batches(bppms_valid, max_len, batch_size=16)
-
-    # 🔹 Pad labels using JAX in batches
-    log_message("Padding coordinates in batches")
-    def pad_coord_fn(arr):
-        return pad_coordinates_jax(arr, max_len)
-    y_train_batched = batch_process_arrays(y_train, pad_coord_fn, batch_size=64, description="Padding train coords")
-    y_valid_batched = batch_process_arrays(y_valid, pad_coord_fn, batch_size=64, description="Padding valid coords")
-
-    # Convert to JAX arrays
-    log_message("Converting coordinates to JAX arrays")
-    y_train_pad = jnp.array(y_train_batched)
-    y_valid_pad = jnp.array(y_valid_batched)
-
-    # Load BPPMs from HDF5 files in batches and convert to JAX arrays
-    log_message("Loading BPPMs from HDF5 with batch-by-batch processing to avoid OOM")
-    bppms_train_file = load_bppms_from_h5(bppms_train_h5, batch_size=4, use_cpu=True)
-    bppms_valid_file = load_bppms_from_h5(bppms_valid_h5, batch_size=4, use_cpu=True)
-
-    # Keep the intermediate HDF5 files for reference
-    log_message("Keeping intermediate HDF5 files for training")
-
-    # 🔹 Save processed data to HDF5 format
-    log_message("Saving processed data to HDF5 format")
-    data_dict = {
-        'train': {
-            'X': X_train_pad,
-            'y': y_train_pad,
-            'msas': msas_train_pad,
-            'bppms_file': bppms_train_file,  # Store file path instead of array
-            'target_ids': np.array(train_ids, dtype='S')  # Convert strings to fixed-length bytes
-        },
-        'valid': {
-            'X': X_valid_pad,
-            'y': y_valid_pad,
-            'msas': msas_valid_pad,
-            'bppms_file': bppms_valid_file,  # Store file path instead of array
-            'target_ids': np.array(valid_ids, dtype='S')
-        },
-        'max_len': max_len
-    }
-
-    # Save to both formats for backward compatibility
-    save_to_hdf5("data/processed/processed_data_msa_bppm.h5", data_dict)
-
-    # Also save in pickle format for backward compatibility
-    log_message("Also saving in pickle format for backward compatibility")
-    with open("data/processed/processed_data_msa_bppm.pkl", "wb") as f:
-        pickle.dump(
-            (
-                X_train_pad, y_train_pad, msas_train_pad, bppms_train_file,
-                X_valid_pad, y_valid_pad, msas_valid_pad, bppms_valid_file,
-                max_len
-            ),
-            f
-        )
+    # Clean up any existing .npz or .pkl files that might confuse users
+    for ext in [".npz", ".pkl"]:
+        for prefix in ["processed_data_final", "processed_data_valid_final"]:
+            file_path = f"data/processed/{prefix}{ext}"
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    log_message(f"Removed obsolete file: {file_path}")
+                except:
+                    log_message(f"Note: Could not remove obsolete file: {file_path}")
 
     total_time = time.time() - start_time
-    log_message(f"✅ Data processing complete with MSA and BPPM features in {total_time:.2f} seconds!")
-    log_message("Files saved to data/processed/ in both HDF5 and pickle formats\n")
+    log_message(
+        f"✅ Data processing complete with unified features in {total_time:.2f} seconds!"
+    )
+    log_message(f"Training samples: {train_result['samples_processed']}")
+    log_message(f"Validation samples: {valid_result['samples_processed']}")
+    log_message("Files saved to data/processed/ in HDF5 format\n")
